@@ -856,6 +856,161 @@ impl StampWait {
     }
 }
 
+/// The completion stamp one drain of one channel owes, coalesced.
+///
+/// Every packet in a `drain_child_fifo` call stamps **the same slot** — the
+/// index is read once from the channel's register block before the loop — and a
+/// stamp wait is satisfied by any value at or past the one awaited
+/// ([`StampWait::satisfied_by`]). So a run of stamps to one slot is observable
+/// only through its greatest value unless the guest samples between the writes,
+/// and writing only that value discharges every wait the run would have.
+///
+/// That matters because a stamp is not a word write. On the Vulkan arm
+/// `write_stamp` submits a command buffer, measured at **12.3 us a packet**
+/// against 59 ns for the tail read beside it.
+///
+/// # What it bought, six driven macos-13 boots, one binary, both arms
+///
+/// All six in one compositing regime (995-999 draws a frame), no panics, same
+/// desktop. `gpu_stamps` fell to **1.9 %** of the per-packet arm and the span
+/// with it:
+///
+/// ```text
+///                   coalesced    per packet
+/// stamp ms/s         5.9-6.8     77.1-97.2
+/// unnamed in drain   224-231      314-317
+/// duty              0.80-0.81    0.89-0.90
+/// slot_us              29 049        37 874
+/// ```
+///
+/// **The arithmetic closes**: the stamp span fell 90.3 ms/s and the whole drain
+/// residue fell 88.6 ms/s, so the time was removed rather than relocated — and
+/// `proc - draw - compute` is 197 against 201 ms/s, unchanged, which says the
+/// same from the other side.
+///
+/// It buys **headroom, not frames**. `present_hz`/`offered_hz` are 15.05 against
+/// 14.90; the guest paces this rail and four CPU wins in a row have moved it by
+/// nothing.
+///
+/// # It holds on all six guest drivers
+///
+/// The measurement above is macos-13 alone, and *when a completion becomes
+/// visible* is exactly the class that can be fine on one guest driver and stall
+/// another — failing as a frozen desktop rather than as a decline, which no
+/// counter reports. So all six x86 rails were swept:
+///
+/// ```text
+/// macos-11  dev=1 ssh=1 dock=1 sd=184 panic=0
+/// macos-12  dev=1 ssh=1 dock=1 sd=147 panic=0
+/// macos-13  dev=1 ssh=1 dock=1 sd=131 panic=0
+/// macos-14  dev=1 ssh=1 dock=1 sd=215 panic=0
+/// macos-15  dev=1 ssh=1 dock=1 sd=281 panic=0
+/// macos-26  dev=1 ssh=1 dock=1 sd=126 panic=0
+/// ```
+///
+/// `sd` is the field that answers the question — host-window standard deviation,
+/// ~38 for the boot screen and >100 for a composited desktop. Every rail cleared
+/// 126, so every one of them put a picture up rather than sitting on a stamp it
+/// was still waiting for. `stamp_write_forward` runs 345-1815 a boot across the
+/// six, so the coalesced write is landing everywhere and not only where it was
+/// tuned.
+///
+/// These are undriven boots: they prove the desktop composites on each driver,
+/// not that the saving reproduces there. Only macos-13 has been driven.
+///
+/// **One thing this was expected to do and does not.** `batch_flushes` is
+/// unchanged (0.987, 1.90 draws a flush against 1.85). The reasoning was that
+/// `engine::write_stamp_after_guest_writes` appends to the open batch and then
+/// flushes it, so removing the stamps should let the batch accumulate. It does
+/// not, so the batch is flushed by something else and the stamp rode along with
+/// a flush that was already going to happen. Do not repeat the claim that the
+/// stamp was what flushed the draw batch.
+///
+/// [`Self::latch`] takes the **maximum in wrapping-signed order** rather than
+/// the last value seen. For a well-formed guest those are the same, and taking
+/// the maximum means this device cannot introduce a regressing stamp even if a
+/// regressing one arrives — a slot going backwards would unsatisfy a wait the
+/// guest had already been told was met.
+#[derive(Clone, Copy, Default)]
+pub struct PendingStamp {
+    /// `None` until a packet in this drain has completed. A drain that stamps
+    /// nothing owes nothing and must submit nothing.
+    value: Option<u32>,
+}
+
+impl PendingStamp {
+    /// Fold one packet's completion stamp in, keeping the later of the two in
+    /// the same wrapping-signed order [`StampWait::satisfied_by`] compares in.
+    pub fn latch(&mut self, stamp: u32) {
+        self.value = Some(match self.value {
+            Some(held) if stamp.wrapping_sub(held) as i32 <= 0 => held,
+            _ => stamp,
+        });
+    }
+
+    /// The value owed, or `None` when this drain stamped nothing.
+    pub fn owed(self) -> Option<u32> {
+        self.value
+    }
+
+    /// Whether `wait` is already discharged by what this drain has latched but
+    /// not yet written.
+    ///
+    /// Without this a packet waiting on the slot an earlier packet in the same
+    /// drain stamped would read the stale word out of guest RAM, return
+    /// [`StampVerdict::Hold`], and park the channel against a stamp this device
+    /// is itself holding. `slot` is the drain's own stamp index; a wait naming
+    /// any other slot is not ours to answer.
+    ///
+    /// # It fires zero times, and the hazard it guards is real
+    ///
+    /// The A/B above is the same six boots. `packet_stamp_wait_met_pending` is
+    /// **0** on the coalesced arm while `packet_stamp_wait_held` **more than
+    /// doubled**, 5 073 against 2 237, taking `setup_calls` up 47 % with it in
+    /// re-drains. Those two readings together say this comparison never matches:
+    /// the packets that should have been answered here fall through to the stale
+    /// word instead.
+    ///
+    /// It is not a correctness failure — every `break` flushes the pending
+    /// stamp, so a held packet's retry finds the word — but it is ~2 800
+    /// avoidable round trips a boot behind a guard that reads as working.
+    ///
+    /// # Why, measured rather than guessed
+    ///
+    /// It is **not** an encoding mismatch, which was the first suspicion. The
+    /// boot's own `packet_stamp_wait_unmet` lines name both sides, and they
+    /// disagree about the *channel*, not the spelling:
+    ///
+    /// ```text
+    /// packet_stamp_wait_unmet opcode=0x37 ch1 index=2 awaited=0xe  current=0xa
+    /// packet_stamp_wait_unmet opcode=0x6  ch5 index=1 awaited=0x5  current=0x3
+    /// packet_stamp_wait_unmet opcode=0x22 ch2 index=4 awaited=0x1  current=0x0
+    /// ```
+    ///
+    /// Channel 1 waits on slot 2, channel 5 on slot 1, channel 2 on slot 4.
+    /// **Every one of them is waiting on a slot some other channel writes**, and
+    /// this guard answers only the drain's own slot — by construction, as its
+    /// last line above says. So it is not broken; it covers a case this workload
+    /// does not produce, while the case the workload does produce is the one it
+    /// declines.
+    ///
+    /// The mechanism is nesting: `process_child_packet` can reach `drain_other`,
+    /// so channel B's drain runs inside channel A's, and A's latched stamps are
+    /// sitting in A's stack frame where B cannot see them. Answering from them
+    /// would be correct for the same reason it is correct here — the drain
+    /// thread is single-threaded, so a latched stamp is work that finished
+    /// before the waiting packet was decoded — but it needs the latch to live in
+    /// `DeviceState` keyed by channel rather than in a local.
+    ///
+    /// **That is worth ~0.2 ms/s and no more**: 2 836 extra holds over a 45 s
+    /// boot, each costing a re-drain, against a change that bought 88 ms/s. It
+    /// is recorded because a guard that fires zero times should say why, not
+    /// because it is the next thing to fix.
+    fn discharges(self, slot: u32, wait: StampWait) -> bool {
+        stamp_slot_index(wait.index) == slot && self.value.is_some_and(|v| wait.satisfied_by(v))
+    }
+}
+
 /// Parsed FIFO packet (main + child share framing).
 ///
 /// `stamp_waits` is the record array between header and payload, decoded. The
@@ -1179,6 +1334,7 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     host: &H,
     channel: Option<u32>,
     packet: &Packet,
+    pending: Option<(u32, PendingStamp)>,
 ) -> StampVerdict {
     if packet.stamp_waits.is_empty() {
         return StampVerdict::Ready;
@@ -1186,6 +1342,15 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
     let mut verdict = StampVerdict::Ready;
     for wait in &packet.stamp_waits {
         let index = stamp_slot_index(wait.index);
+        // Answered from the drain's own latch before guest RAM, because the word
+        // in guest RAM is stale by exactly the stamps this drain is holding. The
+        // ordering the wait asks about already holds: packets are processed in
+        // order on this thread, so a stamp latched here is work that finished
+        // before the packet doing the waiting was decoded.
+        if pending.is_some_and(|(slot, held)| held.discharges(slot, *wait)) {
+            note_store_route("packet_stamp_wait_met_pending");
+            continue;
+        }
         let unresolvable = |reason: &'static str, detail: String| {
             note_store_route("packet_stamp_wait_unresolvable");
             if crate::observe::first_sight("packet_stamp_wait_unresolvable", u64::from(index)) {
@@ -1257,7 +1422,21 @@ fn note_packet_stamp_waits<H: HostMemory + HostOps>(
 /// must stay quiet — and reading the second as the first put a
 /// `packet_bad_size` line on the always-on channel for a healthy producer
 /// mid-write, while making `Incomplete` unreachable.
+/// Timed at the function for the same reason [`read_ring_bytes`] is: the count
+/// this keeps is the packet count both FIFOs are normalized by.
 fn decode_packet(
+    bytes: &[u8],
+    head: u32,
+    available: u32,
+    ring_capacity: u32,
+) -> Result<Packet, PacketError> {
+    let started = std::time::Instant::now();
+    let out = decode_packet_inner(bytes, head, available, ring_capacity);
+    census::note_drain_decode(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn decode_packet_inner(
     bytes: &[u8],
     head: u32,
     available: u32,
@@ -1318,7 +1497,23 @@ fn decode_packet(
     })
 }
 
+/// Timed at the function rather than at its four call sites, so both FIFOs and
+/// both reads per packet are counted and a fifth call site cannot be added
+/// without being measured.
 fn read_ring_bytes<M: HostMemory>(
+    mem: &M,
+    base_gpa: u64,
+    ring_size: u32,
+    absolute: u32,
+    len: u32,
+) -> Result<Vec<u8>, MemError> {
+    let started = std::time::Instant::now();
+    let out = read_ring_bytes_inner(mem, base_gpa, ring_size, absolute, len);
+    census::note_drain_ring(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn read_ring_bytes_inner<M: HostMemory>(
     mem: &M,
     base_gpa: u64,
     ring_size: u32,
@@ -1591,6 +1786,55 @@ fn reply_device_info<H: HostMemory + HostOps>(
         .filter(|&(key, _)| key < key_table_len)
         .collect();
     let above_ceiling = served.len() - caps.len();
+    // The mirror of `above_ceiling`, and the direction that can cost guest work.
+    //
+    // `above_ceiling` counts keys this device answers that the guest discards —
+    // harmless, and until now it was the only direction reported. The other
+    // direction is a key the guest has a parse arm for and this device never
+    // sends: the guest's walker stores nothing into that field, so its Metal
+    // plugin answers from whatever the capability struct was initialised to.
+    // Per [`DEVICE_INFO_CAPS`]'s own doc a value here is an *instruction to the
+    // guest about what it may build*, so a key left out is a silent
+    // instruction rather than a silent omission, and nothing said how many
+    // there were.
+    //
+    // Split in two, because the halves mean different things and only one of
+    // them is a decision this repository made. A **hole** is a key inside the
+    // range the table already covers that the table skips — either nobody
+    // answered it or the capture it came from never saw it. A **tail** key is
+    // past everything this device has ever been asked for, so it is a newer
+    // guest asking a newer question. One combined number would make a guest
+    // that merely parses further look identical to a table with gaps in it,
+    // and those want opposite work.
+    //
+    // Bounded by construction: the hole list cannot be longer than the table's
+    // own highest key, and the tail is a count rather than a list, so a guest
+    // declaring an absurd ceiling cannot turn this into a log flood.
+    let answered: std::collections::BTreeSet<u32> = caps.iter().map(|&(key, _)| key).collect();
+    let table_top = served.iter().map(|&(key, _)| key).max().unwrap_or(0);
+    // Key 0 terminates the walk and is not a key, so the parseable set starts
+    // at 1.
+    // A key the guest's walker has no arm for is not a hole: nothing would ever
+    // consume a value sent for it. Reporting one sends the next reader hunting
+    // for a value to fill a field that does not exist, which is a boot this
+    // investigation actually spent — see
+    // [`crate::model::DEVICE_INFO_DEAD_KEYS`].
+    let holes: Vec<u32> = (1..key_table_len.min(table_top.saturating_add(1)))
+        .filter(|key| !answered.contains(key))
+        .filter(|key| !crate::model::DEVICE_INFO_DEAD_KEYS.contains(key))
+        .collect();
+    let tail = key_table_len.saturating_sub(table_top.saturating_add(1));
+    // A hole this device has characterized is a decision; a hole it has not is a
+    // guest capability field nobody here has ever looked at. Only the second is
+    // a finding, and they are counted apart because the first set is expected to
+    // be non-empty forever — a combined count can never read as an alarm.
+    let unknown_holes = holes
+        .iter()
+        .filter(|key| !crate::model::DEVICE_INFO_UNANSWERED_KEYS.contains(key))
+        .count();
+    note_store_route_n("device_info_key_holes", holes.len() as u64);
+    note_store_route_n("device_info_key_holes_unknown", unknown_holes as u64);
+    note_store_route_n("device_info_key_tail", u64::from(tail));
     // Printed on every reply, not only when something changed. A host that
     // already meets the table reduces nothing, and then silence would be
     // indistinguishable from the derivation never having run — which is exactly
@@ -1610,10 +1854,16 @@ fn reply_device_info<H: HostMemory + HostOps>(
         .map(|((key, answer), (_, table))| format!("key{key}={answer}(was {table})"))
         .collect();
     crate::observe::off(format!(
-        "device_info version={} key_table_len={} above_ceiling={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
+        "device_info version={} key_table_len={} above_ceiling={} holes=[{}] tail={} dual_plane={} host_samples={} host_d24s8={} host_threads={}x{}x{} host_tg_mem={} host_fp16={} derived=[{}]",
         version,
         key_table_len,
         above_ceiling,
+        holes
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+        tail,
         u8::from(crate::model::protocol_dual_plane_textures(version)),
         limits.max_sample_count,
         u8::from(limits.d24_stencil8),
@@ -2147,7 +2397,11 @@ pub fn drain_main_fifo<H: HostMemory + HostOps>(state: &mut DeviceState, host: &
             ring_size,
         ) {
             Ok(packet) => {
-                if note_packet_stamp_waits(state, host, None, &packet) == StampVerdict::Hold {
+                // The main FIFO stamps per packet and latches nothing, so there is
+                // no pending value here for a wait to be answered from.
+                if note_packet_stamp_waits(state, host, None, &packet, None)
+                    == StampVerdict::Hold
+                {
                     // Same hold as the child drain, and this is the timeline
                     // where it matters most: the measured root wait is a
                     // `DELETE_TASK` ordered behind a child FIFO's stamp, so
@@ -2306,7 +2560,29 @@ fn ensure_child_ring<M: HostMemory>(
     length
 }
 
+/// The child FIFO's own ring reader, and **the hot one**.
+///
+/// There are two readers over one wire form. [`read_ring_bytes`] serves the
+/// root FIFO and `ring_reads` for it measured **zero** across a driven
+/// `blur=40` boot while the child FIFO decoded ~8 000 packets a second — so
+/// timing only that one reports a rail that never runs and reads exactly like a
+/// span that is free. Both are counted into the same pair now; a split by FIFO
+/// would be the next refinement if the total turns out to matter.
 fn read_child_ring_bytes<M: HostMemory>(
+    mem: &M,
+    page_gpas: &[u64],
+    ring_length: u32,
+    absolute: u32,
+    len: u32,
+    page_shift: u32,
+) -> Result<Vec<u8>, MemError> {
+    let started = std::time::Instant::now();
+    let out = read_child_ring_bytes_inner(mem, page_gpas, ring_length, absolute, len, page_shift);
+    census::note_drain_ring(started.elapsed().as_nanos() as u64);
+    out
+}
+
+fn read_child_ring_bytes_inner<M: HostMemory>(
     mem: &M,
     page_gpas: &[u64],
     ring_length: u32,
@@ -3104,6 +3380,197 @@ impl MapFamily {
     }
 }
 
+/// Record the page-table nodes `gva` descends through under `task_id`, and say
+/// whether this device wrote to any of them since it last saw them as nodes.
+///
+/// Stands here, on the map/unmap packet, for two reasons: the tree is being
+/// edited at exactly this moment, so the nodes read are the live ones; and the
+/// device is already holding the task and the address, so the whole cost is one
+/// descent of at most [`node_guard::MAX_TREE_NODES`] guest reads.
+///
+/// A finding is emitted on the fail channel because it is one — a host write
+/// into a page of page-table entries is the corruption class that ends a guest,
+/// and the zero-word shape of this device's clears is what the guest's own
+/// teardown assertion reads as a missing entry. Everything else is counted and
+/// silent.
+fn observe_page_table_nodes<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+) {
+    use crate::runtime::node_guard::{self, NodeVerdict};
+
+    if !node_guard::enabled() {
+        return;
+    }
+    let Some(geometry) =
+        reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
+    else {
+        return;
+    };
+    let Some(entry) = state.tasks.get(task_id) else {
+        return;
+    };
+    let task = reims_vgpu_paging::resolve::Task {
+        active: entry.active,
+        directory_pfn: entry.directory_pfn,
+    };
+    let mut nodes = [0u64; node_guard::MAX_TREE_NODES];
+    let found = reims_vgpu_paging::resolve::task_node_gpas(
+        &crate::runtime::gva_mem::HostPhys(host),
+        geometry,
+        &task,
+        gva,
+        &mut nodes,
+    );
+    if found == 0 {
+        return;
+    }
+
+    let now_us = crate::observe::elapsed_us();
+    // The write census is read while the watch is mutated, so it is split off
+    // first: both live on `DeviceState` and only one of them is being written.
+    let DeviceState {
+        host_writes,
+        node_guard: watches,
+        ..
+    } = state;
+    let watch = watches.entry(task_id).or_default();
+    for &gpa in &nodes[..found] {
+        let verdict = watch.observe(host_writes, gpa, now_us);
+        note_store_route(verdict.route());
+        if let NodeVerdict::Wrote { gap_us } = verdict {
+            if crate::observe::first_sight("node_guard_wrote_node_page", gpa) {
+                crate::observe::fail(format!(
+                    "node_guard reason={} task={task_id} node_gpa={gpa:#x} gva={gva:#x} \
+                     gap_us={gap_us} watched={} refused={} (this device wrote into a guest page \
+                     holding page-table entries; a zero word landing there is what the guest's \
+                     own teardown reads as an entry it has already cleared, and it panics on one)",
+                    verdict.route(),
+                    watch.watched(),
+                    watch.refused(),
+                ));
+            }
+        }
+    }
+}
+
+/// Record the guest-physical pages of `[gva, gva+length)` as released, on an
+/// unmap, or as handed back, on a map.
+///
+/// Both directions matter and the map one is not an afterthought: a page the
+/// guest maps again is a page this device is entitled to write, so leaving it
+/// watched would report every recycled page as a defect. See
+/// [`crate::runtime::released_pages`].
+///
+/// The resolve runs against the live page table, which on an unmap means it has
+/// to happen before the packet is applied. A range that no longer translates
+/// resolves to fewer pages than it spans, and that is not an error here — those
+/// pages are already gone and there is nothing left to watch.
+fn note_released_or_remapped<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    family: MapFamily,
+) {
+    if !crate::runtime::node_guard::enabled() {
+        return;
+    }
+    let pages = crate::runtime::gva_mem::task_gva_page_gpa_set(
+        host,
+        &state.tasks,
+        task_id,
+        gva,
+        length,
+        state.page_shift,
+    );
+    if pages.is_empty() {
+        return;
+    }
+    let now_us = crate::observe::elapsed_us();
+    let DeviceState {
+        host_writes,
+        released_pages: watch,
+        ..
+    } = state;
+    match family {
+        MapFamily::UnmapMemory => {
+            for gpa in pages {
+                watch.release(host_writes, task_id, gpa, now_us);
+            }
+        }
+        _ => {
+            for gpa in pages {
+                watch.remapped(gpa);
+            }
+        }
+    }
+}
+
+/// Say whether this range's entries are there, and on a map — the one direction
+/// the guest orders — treat their absence as the defect it is.
+///
+/// The guest finishes wiring a range before it submits the map for it, so a map
+/// whose range is not fully covered is a mapping its own tree does not hold. It
+/// submits an unmap *before* unwiring, so that direction is a race and is
+/// counted rather than judged; keeping it is what proves the walk works, since a
+/// broken walk would read absent on both sides. See
+/// [`crate::runtime::range_coverage`].
+fn observe_range_coverage<H: HostMemory + HostOps>(
+    state: &DeviceState,
+    host: &H,
+    task_id: u32,
+    gva: u64,
+    length: u64,
+    op: crate::runtime::range_coverage::Op,
+) {
+    use crate::runtime::range_coverage::{self, Coverage};
+
+    if !range_coverage::enabled() {
+        return;
+    }
+    let (spanned, scanned) = range_coverage::pages_of(length, state.page_shift);
+    if scanned == 0 {
+        return;
+    }
+    if scanned < spanned {
+        note_store_route(op.truncated_route());
+    }
+    let Some(geometry) = reims_vgpu_paging::resolve::geometry_for_page_shift(state.page_shift)
+    else {
+        return;
+    };
+    let Some(entry) = state.tasks.get(task_id) else {
+        return;
+    };
+    let task = reims_vgpu_paging::resolve::Task {
+        active: entry.active,
+        directory_pfn: entry.directory_pfn,
+    };
+    let counts = reims_vgpu_paging::resolve::range_coverage(
+        &crate::runtime::gva_mem::HostPhys(host),
+        geometry,
+        &task,
+        gva,
+        scanned,
+    );
+    let verdict = counts.as_ref().map_or(Coverage::Unwalkable, Coverage::of);
+    let route = verdict.route(op);
+    note_store_route(route);
+    if verdict.is_finding(op) && crate::observe::first_sight(route, u64::from(task_id)) {
+        let leaf = verdict.is_leaf_level().unwrap_or(false);
+        crate::observe::fail(format!(
+            "range_coverage reason={route} task={task_id} gva={gva:#x} len={length:#x} \
+             pages={spanned} scanned={scanned} leaf_level={leaf} detail={verdict:?} \
+             (the guest wires a range fully before publishing the map for it, so a page \
+             without an entry here is a page its own teardown will later assert on)"
+        ));
+    }
+}
+
 /// The shared body of the six lifecycle commands named by [`MapFamily`].
 fn apply_map_family<H: HostMemory + HostOps>(
     state: &mut DeviceState,
@@ -3124,6 +3591,72 @@ fn apply_map_family<H: HostMemory + HostOps>(
         let task_id = crate::contract::endian::ld32(&packet.payload[0..]);
         let gva = crate::contract::endian::ld64(&packet.payload[4..]);
         let length = crate::contract::endian::ld64(&packet.payload[12..]);
+        // Audit the interval against what this task already has live: a range
+        // mapped twice or unmapped without a map is a disagreement the guest's
+        // own teardown assertion will eventually find.
+        //
+        // Both fields are the values the guest's own `allocate`/`deallocate`
+        // receive: its length getter forwards to the same call this packet's
+        // length field is built from, and the address is one getter used by
+        // both. So these intervals are the page-table ranges and not merely
+        // consistent with themselves. Observation only; nothing reads the
+        // verdict. See `runtime::map_audit`.
+        {
+            let page_size = 1u64 << state.page_shift;
+            let intervals = state.map_audit.entry(task_id).or_default();
+            let verdict = if matches!(family, MapFamily::MapMemory2) {
+                intervals.map(gva, length, page_size)
+            } else {
+                intervals.unmap(gva, length)
+            };
+            // Counted on every verdict, including `Consistent`. The fail line
+            // below is emitted only on a finding and deduped on top of that, so
+            // without this the audit's silence would be indistinguishable from
+            // the audit never having run — which is what "clean on a dozen
+            // panicking boots" actually rested on. The census is the only
+            // never-fired signal there is.
+            note_store_route(verdict.slug());
+            if verdict.is_finding()
+                && crate::observe::first_sight(verdict.slug(), u64::from(task_id) << 32 | u64::from(channel_id))
+            {
+                let live = intervals.live_count();
+                crate::observe::fail(format!(
+                    "map_audit op={name} reason={} task={task_id} gva={gva:#x} len={length:#x} \
+                     live={live} detail={verdict:?} (the guest applies this exact interval to its \
+                     own page table; a disagreement here is one its teardown will assert on)",
+                    verdict.slug()
+                ));
+            }
+        }
+        // The other half of the same question, and the one the interval audit
+        // reading clean moves the weight onto: has this device *written* into a
+        // page that holds the guest's page-table entries? The descent below is
+        // the only work done for it — the write census it asks is already kept
+        // for the sampled cache. See `runtime::node_guard`.
+        observe_page_table_nodes(state, host, task_id, gva);
+        // And the half `node_guard` structurally cannot see: a write landing on
+        // a page *before* it becomes a node. The page list has to be resolved
+        // here, ahead of the unmap being applied, because this is the last
+        // moment those addresses translate. See `runtime::released_pages`.
+        note_released_or_remapped(state, host, task_id, gva, length, family);
+        // And the question none of the three above asks, because none of them
+        // needs a host write to be true: are this range's entries in the state
+        // the guest's own next step requires? It asserts per page that an unmap
+        // finds one and a map does not. Both directions are read, and the one
+        // that cannot end a boot is what makes the other's reading evidence —
+        // see `runtime::range_coverage`.
+        observe_range_coverage(
+            state,
+            host,
+            task_id,
+            gva,
+            length,
+            if matches!(family, MapFamily::UnmapMemory) {
+                crate::runtime::range_coverage::Op::Unmap
+            } else {
+                crate::runtime::range_coverage::Op::Map
+            },
+        );
         // Verbose-gated walk probe at map/unmap time. This runs a full
         // guest page-table walk (`diagnose_gva_walk`) purely to build the
         // log string, and fired ~9k times/boot on the drain path — a flood
@@ -3352,7 +3885,14 @@ fn apply_map_family<H: HostMemory + HostOps>(
         use crate::runtime::decode::fifo::decode_synchronize_resources;
         match decode_synchronize_resources(&packet.payload) {
             Ok(cmd) => {
-                crate::runtime::render_writeback::settle_guest_writes(
+                // The guest asking for a resource synchronize is the one
+                // host-to-guest copy the contract actually names, so it is the
+                // land point every owed frame is owed to. A driven boot issues
+                // zero of these; a boot where this arm fires is a boot where the
+                // lazy rail is being asked for exactly what it defers.
+                crate::runtime::writeback_debt::settle_unnamed(
+                    state,
+                    host,
                     crate::runtime::render_writeback::SettleSite::ChildStamp,
                 );
                 let oid = cmd.object_ids.first().copied().unwrap_or(0);
@@ -4009,6 +4549,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     let Some(regs_off) = child_reg_block_offset(channel_id) else {
         return;
     };
+    let setup_started = std::time::Instant::now();
     let regs_gpa = state.pfn_gpa(state.gfx.root_page) + regs_off;
 
     let mut head = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_HEAD) {
@@ -4050,6 +4591,7 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         return;
     }
     let page_gpas = state.child_rings[channel_id as usize].page_gpas.clone();
+    census::note_drain_setup(setup_started.elapsed().as_nanos() as u64);
 
     // Nested drain_other must skip this channel (no re-enter head).
     // Use a bit mask so nested drains skip the full stack, not only the leaf.
@@ -4062,8 +4604,25 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
     // See `drain_main_fifo`'s copy for what a sticky bit would cost.
     state.stamp_deferred_mask &= !bit;
 
+    // Every packet below stamps `stamp_index`, which was read once above, so the
+    // whole drain owes one slot one value. See [`PendingStamp`] for why that is
+    // collapsed rather than written per packet, and `env::STAMP_COALESCE` for
+    // the switch that restores the per-packet arm.
+    let coalesce = crate::env::switch(crate::env::STAMP_COALESCE) != crate::env::Switch::Off;
+    let mut pending = PendingStamp::default();
+    // The slot the latch is about, resolved the same way `write_stamp` resolves
+    // it, so a wait naming that slot is compared against the same index the
+    // pending value will be written to.
+    let stamp_index_slot = stamp_slot_index(stamp_index);
+
     loop {
-        let tail = match crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL) {
+        let regs_started = std::time::Instant::now();
+        let tail_read = crate::runtime::host::read_u32(host, regs_gpa + CHILD_REG_TAIL);
+        census::note_drain_regs(
+            census::RegsOp::TailRead,
+            regs_started.elapsed().as_nanos() as u64,
+        );
+        let tail = match tail_read {
             Ok(v) => v,
             Err(_) => {
                 state.record_fail(FailEvent::MalformedChildPacket {
@@ -4143,8 +4702,13 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
         }
         match decode_packet(&snap, head, available, ring_length) {
             Ok(packet) => {
-                if note_packet_stamp_waits(state, host, Some(channel_id), &packet)
-                    == StampVerdict::Hold
+                if note_packet_stamp_waits(
+                    state,
+                    host,
+                    Some(channel_id),
+                    &packet,
+                    Some((stamp_index_slot, pending)),
+                ) == StampVerdict::Hold
                 {
                     // The guest ordered this packet behind work that has not
                     // reached its stamp. Hold it: head and completion stamp stay
@@ -4158,9 +4722,10 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     state.pending.child_mask |= bit;
                     break;
                 }
-                if process_child_packet(state, host, channel_id, &packet)
-                    == ChildPacketDisposition::Deferred
-                {
+                let proc_started = std::time::Instant::now();
+                let disposition = process_child_packet(state, host, channel_id, &packet);
+                census::note_drain_proc(packet.opcode, proc_started.elapsed().as_nanos() as u64);
+                if disposition == ChildPacketDisposition::Deferred {
                     // Translation owns only immutable AIR bytes. Keep head and
                     // stamp untouched so retry cannot duplicate any packet
                     // side effect; continue with sibling channels in the
@@ -4168,14 +4733,18 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                     break;
                 }
                 head = packet.next_head;
-                if gpa_map::write_u32(
+                let head_started = std::time::Instant::now();
+                let head_write = gpa_map::write_u32(
                     host,
                     regs_gpa + CHILD_REG_HEAD,
                     head,
                     state.page_size() as usize,
-                )
-                .is_err()
-                {
+                );
+                census::note_drain_regs(
+                    census::RegsOp::HeadWrite,
+                    head_started.elapsed().as_nanos() as u64,
+                );
+                if head_write.is_err() {
                     // The packet was processed + stamped, but the consumer
                     // pointer never advanced: the next drain re-reads the stale
                     // head and RE-EXECUTES the same packets. Fail-visible so
@@ -4198,7 +4767,19 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 // an async execution path, that ordering has to come back with
                 // it — and be written against the async model that then exists,
                 // not inherited from an empty queue.
-                write_stamp(state, host, stamp_index, packet.completion_stamp);
+                if coalesce {
+                    // Deliberately untimed: the cost this span was measuring is
+                    // the submit, and folding a value into a latch is not one.
+                    // The submit it defers to is timed where it happens, below.
+                    pending.latch(packet.completion_stamp);
+                } else {
+                    let stamp_started = std::time::Instant::now();
+                    write_stamp(state, host, stamp_index, packet.completion_stamp);
+                    census::note_drain_regs(
+                        census::RegsOp::Stamp,
+                        stamp_started.elapsed().as_nanos() as u64,
+                    );
+                }
                 if state.pending.host_action_yield {
                     if head != tail {
                         state.pending.child_mask |= bit;
@@ -4217,6 +4798,20 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 break;
             }
         }
+    }
+
+    // Every `break` above lands here, which is what makes one site enough: a
+    // drain that stops on a held stamp, a deferred translation, a decode fault
+    // or a host-action yield owes the stamps it already latched exactly as a
+    // drain that ran the ring dry does. Leaving one unwritten is a guest waiting
+    // on a word that never arrives.
+    if let Some(value) = pending.owed() {
+        let stamp_started = std::time::Instant::now();
+        write_stamp(state, host, stamp_index, value);
+        census::note_drain_regs(
+            census::RegsOp::Stamp,
+            stamp_started.elapsed().as_nanos() as u64,
+        );
     }
 
     state.draining_mask &= !bit;
@@ -4320,14 +4915,24 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
     state.pending.iosfc = false;
 }
 
-/// Display-side present completion (PGDisplay `_presentMappedSurface`
-/// completion block, live PVG binary RE in): after
-/// `presentFrame` retains the surface into `+0x188`, the block sets pending
-/// bit 1 on the display shared page, reads the enable mask, and pokes the
-/// display IRQ when the guest asked for present notifications. This is the
-/// guest's frame-done pacing edge — separate from the packet header stamp
-/// (the swap fence). Without it the guest keeps swapping (fence releases)
-/// but never receives the per-present display event.
+/// Display-side present completion: after `presentFrame` retains the surface,
+/// set pending bit 1 on the display shared page, read the enable mask, and poke
+/// the display IRQ when the guest asked for present notifications. This is the
+/// guest's frame-done pacing edge — separate from the packet header stamp (the
+/// swap fence). Without it the guest keeps swapping (fence releases) but never
+/// receives the per-present display event.
+///
+/// **This edge is a wakeup as well as a notification, and one guest wait has no
+/// deadline.** The guest's display pipe drains its transaction queue by sleeping
+/// on its command gate until the consumed and submitted indices meet. The
+/// per-transaction wait is bounded — a second, after which it re-tests and logs
+/// — but the *queue-idle* wait taken on the WSAA defer transition is not: it
+/// sleeps with no deadline and is woken only by the transaction interrupt this
+/// bit raises. A device that finishes the work and never rings this bell
+/// therefore hangs that guest permanently rather than slowly, and the guest is
+/// blocked in the window server, before any frame it could present to unblock
+/// itself. Completion of the underlying event is necessary and not sufficient;
+/// the wakeup is the other half.
 pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
@@ -4340,16 +4945,18 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     };
     let gpa = display.shared_gpa;
     if gpa == 0 {
+        note_display_present_signal(DISPLAY_PRESENT_NO_GPA);
         return;
     }
-    let mut mask_le = [0u8; 4];
-    if host
-        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
-        .is_err()
-    {
+    // The mask gates the pending write and not just the interrupt. It used to
+    // gate only the interrupt, which set a bit for a guest that had declined
+    // the class and could therefore never clear it — see
+    // [`display_event_enabled`] for why that residue is not inert.
+    if !display_event_enabled(host, gpa, DISPLAY_PRESENT_EVENT_MASK) {
+        note_display_present_signal(DISPLAY_PRESENT_NOT_ENABLED);
         return;
     }
-    let mask = ld32(&mask_le);
+    note_display_present_signal(DISPLAY_PRESENT_DELIVERED);
     // Pending word is atomic read-and-clear (ldclral) on the guest side; OR
     // the present bit so a not-yet-consumed ONLINE event is preserved.
     let mut pending_le = [0u8; 4];
@@ -4387,11 +4994,9 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     if stale {
         crate::runtime::census::present_proxy::note_stale_online_pending("present", pending);
     }
-    if mask & DISPLAY_PRESENT_EVENT_MASK != 0 {
-        let bit = 1u32 << (display.display_index & 0x1f);
-        interrupt_status.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
-        host.enqueue(HostAction::irq_gfx());
-    }
+    let bit = 1u32 << (display.display_index & 0x1f);
+    interrupt_status.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    host.enqueue(HostAction::irq_gfx());
 }
 
 /// Minimum wall-clock interval shared by both display VBL signal paths, in
@@ -4452,6 +5057,85 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
         .is_ok()
 }
 
+pub(crate) fn display_event_enabled<H: HostMemory>(
+    host: &H,
+    gpa: u64,
+    event_mask: u32,
+) -> bool {
+    let mut mask_le = [0u8; 4];
+    if host
+        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+        .is_err()
+    {
+        return false;
+    }
+    let mask = ld32(&mask_le);
+    crate::runtime::drain::census::note_display_enable_mask(mask);
+    mask & event_mask != 0
+}
+
+pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
+    host: &mut H,
+    gpa: u64,
+    display_index: u32,
+    intr_disp: &std::sync::atomic::AtomicU32,
+    page_size: usize,
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
+) {
+    let now_ms = now_us / 1_000;
+    let mut mask_le = [0u8; 4];
+    if host
+        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+        .is_err()
+    {
+        note_vbl(VBL_NOT_ENABLED, now_ms);
+        return;
+    }
+    let mask = ld32(&mask_le);
+    crate::runtime::drain::census::note_display_enable_mask(mask);
+    let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
+    let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
+    if !vbl && !transaction {
+        note_vbl(VBL_NOT_ENABLED, now_ms);
+        return;
+    }
+    if !claim_display_vbl(last_us, now_us) {
+        note_vbl(VBL_NOT_CLAIMED, now_ms);
+        return;
+    }
+    note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
+    if transaction {
+        note_display_present_signal(DISPLAY_PRESENT_REFRESH);
+    }
+    let mut pending_le = [0u8; 4];
+    let pending = if host
+        .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
+        .is_ok()
+    {
+        ld32(&pending_le)
+    } else {
+        0
+    };
+    let stale = pending & DISPLAY_ONLINE_EVENT_MASK != 0;
+    let mut next = pending & !DISPLAY_ONLINE_EVENT_MASK;
+    if vbl {
+        next |= DISPLAY_VBL_EVENT_MASK;
+    }
+    if transaction {
+        next |= DISPLAY_PRESENT_EVENT_MASK;
+    }
+    shared_w32(host, gpa, DISPLAY_SHARED_PENDING, next, page_size);
+    if stale {
+        crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
+    }
+    intr_disp.fetch_or(
+        1u32 << (display_index & 0x1f),
+        std::sync::atomic::Ordering::AcqRel,
+    );
+    host.enqueue(HostAction::irq_gfx());
+}
+
 /// Pulse VBL at the phase-locked ~120 Hz cadence (grid interval
 /// [`DISPLAY_VBL_MIN_INTERVAL_US`]; see [`claim_display_vbl`]).
 ///
@@ -4465,6 +5149,29 @@ pub fn signal_display_vbl<H: HostMemory + HostOps>(
     last_us: &[std::sync::atomic::AtomicU64; crate::model::MAX_DISPLAY_PORT_COUNT as usize],
 ) {
     signal_display_vbl_all_at(state, host, last_us, crate::observe::elapsed_us());
+}
+
+fn signal_display_vbl_pipe_at<H: HostMemory + HostOps>(
+    display: &mut crate::model::DisplayHandshake,
+    page_size: usize,
+    interrupt_status: &std::sync::atomic::AtomicU32,
+    host: &mut H,
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
+) {
+    if display.shared_gpa == 0 || !display.online_acked {
+        note_vbl(VBL_NOT_ONLINE, now_us / 1_000);
+        return;
+    }
+    signal_display_refresh_classes(
+        host,
+        display.shared_gpa,
+        display.display_index,
+        interrupt_status,
+        page_size,
+        last_us,
+        now_us,
+    );
 }
 
 fn signal_display_vbl_all_at<H: HostMemory + HostOps>(
@@ -4620,72 +5327,29 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     last_us: &std::sync::atomic::AtomicU64,
     now_us: u64,
 ) {
-    let page_size = state.page_size() as usize;
-    let interrupt_status = Arc::clone(&state.gfx.interrupt_status_disp);
-    signal_display_vbl_pipe_at(
-        &mut state.display,
-        page_size,
-        &interrupt_status,
-        host,
-        last_us,
-        now_us,
-    );
-}
-
-fn signal_display_vbl_pipe_at<H: HostMemory + HostOps>(
-    display: &mut crate::model::DisplayHandshake,
-    page_size: usize,
-    interrupt_status: &std::sync::atomic::AtomicU32,
-    host: &mut H,
-    last_us: &std::sync::atomic::AtomicU64,
-    now_us: u64,
-) {
     // The limiter paces in microseconds because 120 Hz is not expressible in
     // whole milliseconds; the census windows in milliseconds so its `t=` stays
     // on the same scale as every other always-on line.
-    let now_ms = now_us / 1_000;
-    if display.shared_gpa == 0 || !display.online_acked {
-        note_vbl(VBL_NOT_ONLINE, now_ms);
-        return;
+    let page_size = state.page_size() as usize;
+    let interrupt_status = Arc::clone(&state.gfx.interrupt_status_disp);
+    for index in state.registered_display_pipes() {
+        let Some(display) = state.display_pipe(index) else {
+            continue;
+        };
+        if display.shared_gpa == 0 || !display.online_acked {
+            note_vbl(VBL_NOT_ONLINE, now_us / 1_000);
+            continue;
+        }
+        signal_display_refresh_classes(
+            host,
+            display.shared_gpa,
+            display.display_index,
+            &interrupt_status,
+            page_size,
+            last_us,
+            now_us,
+        );
     }
-    if !claim_display_vbl(last_us, now_us) {
-        note_vbl(VBL_NOT_CLAIMED, now_ms);
-        return;
-    }
-    note_vbl(VBL_DELIVERED, now_ms);
-    let gpa = display.shared_gpa;
-    let mut pending_le = [0u8; 4];
-    let pending = if host
-        .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
-        .is_ok()
-    {
-        ld32(&pending_le)
-    } else {
-        0
-    };
-    // Drop a stale (already-acked) ONLINE bit so we don't re-deliver it and make
-    // the guest re-run process_online → connectionChange → overlay rebuild (see
-    // signal_display_present_complete). signal_display_vbl only runs post-ack, so
-    // online_acked is already true here; `stale` is 0 on healthy boots (no-op).
-    let stale = display.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
-    let base = if stale {
-        pending & !DISPLAY_ONLINE_EVENT_MASK
-    } else {
-        pending
-    };
-    shared_w32(
-        host,
-        gpa,
-        DISPLAY_SHARED_PENDING,
-        base | DISPLAY_VBL_EVENT_MASK,
-        page_size,
-    );
-    if stale {
-        crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
-    }
-    let bit = 1u32 << (display.display_index & 0x1f);
-    interrupt_status.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
-    host.enqueue(HostAction::irq_gfx());
 }
 
 /// Assert display ONLINE once the guest has published the enable mask.

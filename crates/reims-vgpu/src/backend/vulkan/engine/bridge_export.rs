@@ -120,6 +120,7 @@ impl ExportSlot {
             let memory_type_index = ctx
                 .memory_type_for(
                     requirements.memory_type_bits,
+                    requirements.size,
                     crate::backend::vulkan::caps::MemoryClass::DeviceLocal,
                 )
                 .ok_or_else(|| "no device-local memory type for export image".to_owned())?;

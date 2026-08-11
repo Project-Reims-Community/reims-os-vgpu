@@ -80,6 +80,7 @@ pub mod runtime;
 
 pub mod backend;
 /// Versioned DMA-BUF transport contract consumed by Reims OS Session.
+#[cfg(target_os = "linux")]
 pub mod frame_bridge;
 pub mod qemu;
 

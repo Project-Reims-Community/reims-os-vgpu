@@ -14,7 +14,9 @@ use super::counters::EngineCounters;
 use super::device_lost::{DeviceLostDecline, DeviceLostOp};
 use super::draw_execution::DrawExecutionDecline;
 use super::draw_validation::DrawValidationDecline;
-use super::pools::{BatchTarget, BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey};
+use super::pools::{
+    BatchFit, BatchTarget, BufferSlot, ResourcePools, SampledKey, SampledSlot, TargetKey,
+};
 use super::stage_phase;
 use super::types::{
     BufferContent, ColorWriteMask, DrawError, DrawOutput, DrawRequest, SampledSource,
@@ -78,6 +80,164 @@ impl PendingGuestGather {
     fn regions(&self) -> u64 {
         self.sources.iter().map(|(_, r)| r.len() as u64).sum()
     }
+}
+
+/// One gather turned into a compute dispatch: the descriptor set naming its
+/// three buffers, and how many runs the kernel has to walk.
+struct GatherDispatch {
+    set: vk::DescriptorSet,
+    run_count: u32,
+}
+
+/// Whether the compute gather is on. **Default on since 2026-08-11** — it takes
+/// 21 % off this device's GPU work per draw for byte-identical guest output, and
+/// the CPU cost that kept it off for two sessions is now paid out of drain-worker
+/// headroom that did not exist when it was measured.
+///
+/// `off` restores the ~13 `VkBufferCopy` regions per gathered window. See
+/// [`crate::env::COMPUTE_GATHER`] for both sets of boots and for why the earlier
+/// rejection was right at the time.
+/// Whether the layout-churn probe is on. **Default off**, and never anything but
+/// a probe: it adds two image barriers per draw and removes nothing.
+///
+/// See its one call site for what it prices and why the answer is not otherwise
+/// obtainable. It is a switch and not a `#[cfg]` because the question it answers
+/// is about the host, so it has to be askable on a host somebody else has.
+fn layout_churn_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::LAYOUT_CHURN).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
+fn compute_gather_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        !matches!(
+            crate::env::read(crate::env::COMPUTE_GATHER).0,
+            crate::env::Switch::Off
+        )
+    })
+}
+
+/// Turn every pending gather into dispatches, or `None` to leave the whole
+/// batch on the transfer regions.
+///
+/// # Why the whole batch and not a gather at a time
+///
+/// The two forms need different barriers — one is a `TRANSFER_WRITE` and the
+/// other a `SHADER_WRITE` — and the loop that follows this emits exactly one
+/// barrier for all of them. Mixing forms inside a batch would mean either two
+/// barriers or one over-wide source scope, and this rail is not where an
+/// all-or-nothing costs anything: a decline is a property of the *host* (no
+/// pipeline, no import) or of the arithmetic (an unaligned run), and both are
+/// stable across a command buffer rather than varying gather to gather.
+///
+/// This is the gather direction of the same repair `plan_guest_scatter_dispatches`
+/// made to the writeback, where replacing ~200 transfer regions with one
+/// dispatch was measured at +48 % frames on a driven macos-13 boot. Here it
+/// replaces the 427 000 regions a second the buffer gather issues — the largest
+/// remaining GPU cost on that rail — with one dispatch per gathered window.
+///
+/// # Safety
+///
+/// `gathers` must name buffers live for the whole submission being recorded.
+unsafe fn plan_buffer_gather_dispatches(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    gathers: &[PendingGuestGather],
+) -> Result<Option<Vec<GatherDispatch>>, DrawError> {
+    use super::guest_scatter::{build_gather_run_tables, ScatterRun};
+    let Some(pipeline) = (unsafe { pools.scatter_pipeline(ctx) }) else {
+        return Ok(None);
+    };
+    // Planned for every gather before anything is allocated, so a refusal in the
+    // last one does not leave the first one's staging slot and descriptor set on
+    // the pools for a dispatch that will not be recorded — the same ordering
+    // `plan_guest_scatter_dispatches` states.
+    let mut planned: Vec<(vk::Buffer, vk::Buffer, u64, super::guest_scatter::RunTable)> =
+        Vec::new();
+    for gather in gathers {
+        // The window's own byte count, from the regions themselves rather than
+        // from the slot: `acquire_guest_gather` rounds up to a power-of-two
+        // bucket, and the tighter bound is the one that catches a run reaching
+        // past what this window actually covers.
+        let dst_have: u64 = gather
+            .sources
+            .iter()
+            .flat_map(|(_, copies)| copies.iter())
+            .map(|c| c.dst_offset.saturating_add(c.size))
+            .max()
+            .unwrap_or(0);
+        for (source, copies) in &gather.sources {
+            let _p = super::gather_phase::Span::open(super::gather_phase::Part::Plan);
+            let runs: Vec<ScatterRun> = copies
+                .iter()
+                .map(|c| ScatterRun {
+                    // The guest import is the source here, so the copy's
+                    // `src_offset` is the guest side and its `dst_offset` the
+                    // device-local slot — the exact opposite of the writeback,
+                    // and the whole of what `build_gather_run_tables` exchanges.
+                    src: c.src_offset,
+                    dst: c.dst_offset,
+                    len: c.size,
+                })
+                .collect();
+            match build_gather_run_tables(
+                &runs,
+                ctx.guest_bind_offset_align,
+                ctx.max_storage_buffer_range,
+                dst_have,
+            ) {
+                Ok(built) => planned.extend(
+                    built
+                        .into_iter()
+                        .map(|t| (*source, gather.dst, dst_have, t)),
+                ),
+                Err(decline) => {
+                    counters
+                        .buffer_gather_declined
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::observe::Emit::decline("buffer_gather_plan", &decline).fail_once(0);
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    // One staging slot for every table this command buffer's gathers need, not
+    // one apiece. A gathered window's table is ~200 bytes and this rail issues
+    // ~40 000 of them a second against ~2 200 command buffers, so the acquire
+    // and the write were being paid eighteen times over for bytes that fit in a
+    // single slot.
+    let (runs_slot, places) = {
+        let _s = super::gather_phase::Span::open(super::gather_phase::Part::Stage);
+        let words: Vec<&[u32]> = planned.iter().map(|(_, _, _, t)| &t.words[..]).collect();
+        unsafe { super::stage_run_tables(ctx, pools, counters, &words) }?
+    };
+    let mut out = Vec::with_capacity(planned.len());
+    for ((source, dst, dst_have, table), place) in planned.iter().zip(&places) {
+        let _d = super::gather_phase::Span::open(super::gather_phase::Part::Dset);
+        let set =
+            unsafe { pools.alloc_scatter_descriptor_set(&ctx.device, pipeline.dsl, counters) }?;
+        unsafe {
+            super::guest_scatter::ScatterPipeline::write_set(
+                &ctx.device,
+                set,
+                (*source, table.bind_offset, table.bind_range),
+                (*dst, 0, *dst_have),
+                (runs_slot.buffer, place.bind_offset, place.bind_range),
+            );
+        }
+        out.push(GatherDispatch {
+            set,
+            run_count: table.run_count,
+        });
+    }
+    Ok(Some(out))
 }
 
 /// The one bind range a window's stretches amount to, when they amount to one.
@@ -182,6 +342,13 @@ unsafe fn stage_buffer_content(
                 // direct bind does, so this owes the same quiesce.
                 pools.note_guest_read_recorded();
                 counters.note_buffer_guest_gather(src.total_len, pending.regions());
+                // Counted here and not at the top of this arm, because only a
+                // window that actually gathers is a window a content cache would
+                // have to hold. `key.0` is the `runs` allocation's address,
+                // already computed above as this draw's dedup key — the same
+                // identity one scope wider. See
+                // [`super::pools::buffer_gather_working_set`].
+                super::pools::buffer_gather_working_set::note_gathered(key.0, key.1);
                 gathers.push(pending);
                 bound
             } else {
@@ -697,10 +864,9 @@ impl crate::observe::Decline for SampledImportDecline {
     fn fields(&self) -> Vec<(&'static str, String)> {
         match self {
             Self::CopyOffsetAlignment { offset } => vec![("offset", offset.to_string())],
-            Self::GatherShort { covered, want } => vec![
-                ("covered", covered.to_string()),
-                ("want", want.to_string()),
-            ],
+            Self::GatherShort { covered, want } => {
+                vec![("covered", covered.to_string()), ("want", want.to_string())]
+            }
         }
     }
 }
@@ -1394,6 +1560,41 @@ struct JoinTerms {
     cpu_seed: bool,
     gpu_seed: bool,
     no_open_batch: bool,
+    batch_full: bool,
+    target_switch: bool,
+}
+
+/// Whether [`crate::env::BATCH_MIXED_TARGETS`] is switched off, read once per
+/// process.
+///
+/// Latched for the same reason [`crate::runtime::spirv_bind`]'s extent switch
+/// is: this sits on the per-draw path and `std::env::var_os` is a lock and an
+/// allocation, and the variable cannot change under a running device. The
+/// refusal is named once, on the off channel, so a boot whose submission count
+/// is being compared says in its own log which arm it ran.
+fn batch_mixed_targets_disabled() -> bool {
+    use std::sync::OnceLock;
+    static OFF: OnceLock<bool> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let (state, value) = crate::env::read(crate::env::BATCH_MIXED_TARGETS);
+        match state {
+            crate::env::Switch::Off => {
+                crate::observe::off("batch_mixed reason=batch_mixed_targets_disabled_by_env");
+                true
+            }
+            // An unrecognized spelling is named rather than silently read as the
+            // default. It still takes the default arm: this switch may only turn
+            // a rail off, and a value nobody can parse is not that.
+            crate::env::Switch::Unrecognized => {
+                crate::observe::fail(format!(
+                    "batch_mixed reason=batch_mixed_targets_env_unrecognized value={}",
+                    value.unwrap_or_default()
+                ));
+                false
+            }
+            crate::env::Switch::On | crate::env::Switch::Unset => false,
+        }
+    })
 }
 
 /// What a [`JoinTerms`] rung is a statement about.
@@ -1420,7 +1621,7 @@ impl JoinTerms {
     /// one question and miss the other, and cannot be mis-scoped by landing at
     /// the wrong index — its scope is written beside it, not inferred from
     /// where it sits.
-    const LADDER: [JoinRefusal; 10] = [
+    const LADDER: [JoinRefusal; 12] = [
         (|t| t.force_loss, JoinScope::Draw, "nojoin_force_loss"),
         (|t| t.quirk, JoinScope::Draw, "nojoin_quirk"),
         (|t| t.is_mrt, JoinScope::Draw, "nojoin_mrt"),
@@ -1431,6 +1632,8 @@ impl JoinTerms {
         (|t| t.cpu_seed, JoinScope::Fit, "nojoin_cpu_seed"),
         (|t| t.gpu_seed, JoinScope::Fit, "nojoin_gpu_seed"),
         (|t| t.no_open_batch, JoinScope::Fit, "nojoin_no_open_batch"),
+        (|t| t.batch_full, JoinScope::Fit, "nojoin_batch_full"),
+        (|t| t.target_switch, JoinScope::Fit, "nojoin_target_switch"),
     ];
 
     /// Whether this draw may defer its submit and leave its command buffer
@@ -1637,6 +1840,20 @@ pub(crate) unsafe fn execute_draw_inner(
     // spelled as a feature. No runtime caller ever set it, and the six parity
     // tests that did were all already rendering into a `Surface` identity.
     let output_bgra = req.target_identity.as_ref().is_some_and(|id| id.is_bgra());
+    // Slot 0's attachment format, read from the identity that owns it.
+    //
+    // Two things have to agree about it — the render pass (and so the pipeline)
+    // this draw is compiled against, and the resident image it renders into —
+    // and they used to agree only because both called `resident_color` on the
+    // same flag. Now the identity answers, once, and both take it from here.
+    //
+    // A draw with no target identity renders into a pooled target, which
+    // `acquire_target` creates at the engine's neutral resident colour format.
+    let color0_format = req
+        .target_identity
+        .as_ref()
+        .map(|id| id.resident_format())
+        .unwrap_or(crate::backend::vulkan::translate::pixel::RESIDENT_RGBA_FORMAT);
     // A guest-sourced sampled bind used to force the immediate-submit path.
     // Its read of guest RAM happens when the CB *executes*, and this device
     // acked the packet as soon as it was consumed, so deferred submit stretched
@@ -1704,12 +1921,36 @@ pub(crate) unsafe fn execute_draw_inner(
     // stop at its own term now walks to the end of the ladder and is counted
     // there when the open batch is on another target.
     //
-    // What that leaves is `nojoin_no_open_batch` as the largest refusal, and
-    // it is a statement about `BatchTarget` rather than about the draw — the
-    // batch is keyed by target identity and geometry, so a run alternating
-    // between two surfaces cannot batch at all even though each draw opens
-    // and ends its own render pass inside the command buffer. Nothing read so
-    // far says that key is load-bearing.
+    // What that left was `nojoin_no_open_batch` as the largest refusal, and it
+    // was a statement about `BatchTarget` rather than about the draw — the batch
+    // was keyed by target identity and geometry, so a run alternating between
+    // two surfaces could not batch at all even though each draw opens and ends
+    // its own render pass inside the command buffer.
+    //
+    // # And that key was not load-bearing either
+    //
+    // Driven macos-13 hammer boot, 22 200 draws through the ladder, before:
+    //
+    //   join_appended_self_alias      9 364   42.2 %
+    //   join_appended                 6 786   30.6 %
+    //   nojoin_no_open_batch          5 787   26.1 %
+    //   nojoin_cpu_seed                 263    1.2 %
+    //
+    // So on this rail one refusal was 96 % of all of them, and it named a batch
+    // that was recording and had room. The target now decides nothing: a draw
+    // appends to whatever batch is open, and `BatchTarget` is compared only on
+    // the arm `REIMS_VGPU_BATCH_MIXED_TARGETS=off` selects. What makes that
+    // sound is that no consumer of an open batch reads which image its passes
+    // wrote — `batch_flush` takes the CB, the fence and the accumulated
+    // descriptor sets — and the readback rail has always appended a copy of one
+    // target's image to whatever batch happened to be recording (see
+    // `read_target_leased`'s `batch_readback_joins`).
+    //
+    // The refusal that stood for two conditions is split with it:
+    // `nojoin_no_open_batch` now means only that nothing is recording, and
+    // `nojoin_batch_full` means `BATCH_MAX_DRAWS` is the binding constraint —
+    // which is the next lever if it becomes the largest reading, and was
+    // unreadable while one name covered both.
     //
     // So the batching ceiling was one term: a draw sampling the target it
     // renders into, which the GVA resident sampled rung made common. That term
@@ -1736,6 +1977,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // shared prefix a `debug_assert` had to police. `batch_eligible` is now
     // derived from the same fields the ladder reads, so an added term cannot
     // reach one and miss the other.
+    // Last because it is the only thing here that looks anything up. Evaluated
+    // eagerly, which costs one enum match on a draw an earlier term already
+    // refused. A draw with no identity has no `BatchTarget` to ask about and is
+    // refused by `no_identity` above this in the ladder, so its fit is `None`
+    // and never reaches a name of its own.
+    let fit = batch_target
+        .as_ref()
+        .map(|t| pools.batch_fit(t, batch_mixed_targets_disabled()))
+        .unwrap_or(BatchFit::None);
     let terms = JoinTerms {
         force_loss,
         quirk: ctx.caps.quirks.no_deferred_draw_batching,
@@ -1746,13 +1996,9 @@ pub(crate) unsafe fn execute_draw_inner(
         no_identity: req.target_identity.is_none(),
         cpu_seed: req.target_rgba8.is_some(),
         gpu_seed: req.seed_from_target.is_some(),
-        // Last because it is the only term that looks anything up. Evaluated
-        // eagerly, which costs one `Option` compare on a draw an earlier term
-        // already refused.
-        no_open_batch: batch_target
-            .as_ref()
-            .and_then(|t| pools.batch_slot(t))
-            .is_none(),
+        no_open_batch: matches!(fit, BatchFit::None),
+        batch_full: matches!(fit, BatchFit::Full),
+        target_switch: matches!(fit, BatchFit::OtherTarget),
     };
     let batch_eligible = terms.batch_eligible();
     let no_join = terms.refusal();
@@ -1767,6 +2013,27 @@ pub(crate) unsafe fn execute_draw_inner(
         "join_appended"
     }));
     let joins = no_join.is_none();
+    // Observation only, and the ceiling on the largest GPU-side saving this device
+    // has not taken. Every batched draw begins and ends its own render pass, so at
+    // ~27 draws a command buffer this rail issues ~27 `vkCmdBeginRenderPass` /
+    // `vkCmdEndRenderPass` pairs per submission over full-size attachments. Only a
+    // draw whose target agrees with the batch's could ever share one, so this
+    // split is how much merging could reach — and on a tiled or unified-memory
+    // host, where each pass loads and stores the whole attachment, that is the
+    // difference between a workload that fits in the memory bandwidth and one that
+    // does not.
+    if joins {
+        crate::runtime::drain::note_store_route(
+            match batch_target.as_ref().and_then(|t| pools.batch_target_is(t)) {
+                Some(true) => "join_same_target",
+                Some(false) => "join_other_target",
+                // A joiner with no `BatchTarget` of its own: refused by
+                // `no_identity` above unless something upstream changes, so this
+                // is a healthy zero rather than a third population.
+                None => "join_target_absent",
+            },
+        );
+    }
     // Claim the next ring slot — BEFORE any pool acquire, so a recycled slot
     // can never alias a still-in-flight CB. Blocks (retire) only when every
     // slot is still in flight; the wait lands in retire_wait_us. A batch
@@ -1776,16 +2043,17 @@ pub(crate) unsafe fn execute_draw_inner(
     // so a boot can tell "the CPU is ahead of the ring" from "preparing a draw
     // got slower", which `prep_us` alone cannot.
     phase.enter(super::draw_phase::Phase::Slot);
-    let (cb, fence) = if joins {
-        let target = batch_target.as_ref().expect("joins requires identity");
-        pools.batch_slot(target).expect("joins checked batch_slot")
-    } else {
+    // `joins` is `refusal().is_none()`, and each of the other three `BatchFit`
+    // arms has its own rung, so a join *is* a `BatchFit::Open` and the pair
+    // cannot be any other combination.
+    let (cb, fence) = match fit {
+        BatchFit::Open(cb, fence) if joins => (cb, fence),
         // A fresh command buffer, so the guest-window imports the previous one
         // pinned against eviction may be displaced again. A *joiner*
         // deliberately does not bump: it records into the open batch's CB, which
         // still names every import the draws before it were handed and has not
         // been submitted, so nothing may free one out from under it.
-        pools.begin_entry(ctx, counters)?
+        _ => pools.begin_entry(ctx, counters)?,
     };
     phase.enter(super::draw_phase::Phase::Pipeline);
 
@@ -1844,7 +2112,7 @@ pub(crate) unsafe fn execute_draw_inner(
     };
     let mut pass_key = PassKey::single(
         load_uses_gpu_content || seed_bytes.is_some() || req.seed_from_target.is_some(),
-        output_bgra,
+        color0_format,
     );
     for (i, sec) in req.secondary_targets.iter().enumerate() {
         if i >= MAX_SECONDARY_ATTACH {
@@ -1863,14 +2131,12 @@ pub(crate) unsafe fn execute_draw_inner(
     pass_key.secondary_count = req.secondary_targets.len() as u8;
     pass_key.color_input = req.color_input;
     // Depth is opt-in per draw (only a non-trivial MTLDepthStencilState reaches
-    // here). Combining it with MRT is not yet supported — the ad-hoc MRT
-    // framebuffer would need the depth view appended and the pass rebuilt; no
-    // known workload does both, so reject rather than silently drop depth.
-    if req.depth.is_some() && is_mrt {
-        return Err(DrawError::Unsupported(
-            super::reason::DrawReason::DepthWithSecondaryAttachments,
-        ));
-    }
+    // here) and composes with MRT: the pass appends its attachment after the
+    // secondaries, `clear_values` appends its clear after theirs, and the ad-hoc
+    // framebuffer below is built from the same order. All three orderings are
+    // written once each and agree by construction; nothing branches on whether
+    // the other feature is present.
+    //
     // The depth attachment is resolved here rather than beside the framebuffer
     // below, because the pass key needs an answer this device can only get from
     // the resident: whether a `MTLLoadActionLoad` can be honoured at all.
@@ -1880,11 +2146,13 @@ pub(crate) unsafe fn execute_draw_inner(
     // an image is not in is undefined behaviour rather than a stale read — so
     // "the guest asked to load" and "there is something to load" are two
     // questions and only the second one is about this device.
+    phase.enter(super::draw_phase::Phase::PipelineDepth);
     let depth_attachment = req
         .depth
         .as_ref()
         .map(|_| acquire_depth_view(ctx, pools, req, counters))
         .transpose()?;
+    phase.enter(super::draw_phase::Phase::Pipeline);
     if let Some(d) = &req.depth {
         let load = depth_attachment
             .as_ref()
@@ -1911,12 +2179,15 @@ pub(crate) unsafe fn execute_draw_inner(
         })
         .collect();
 
+    phase.enter(super::draw_phase::Phase::PipelineShader);
     let (vert_digest, vert_module) =
-        caches.get_or_create_shader(ctx, &req.vert_spirv, counters, pools)?;
+        caches.get_or_create_shader_memoized(ctx, &req.vert_spirv, counters, pools)?;
     let (frag_digest, frag_module) =
-        caches.get_or_create_shader(ctx, &req.frag_spirv, counters, pools)?;
+        caches.get_or_create_shader_memoized(ctx, &req.frag_spirv, counters, pools)?;
+    phase.enter(super::draw_phase::Phase::PipelineLayoutPass);
     let (dsl, pipeline_layout) = caches.get_or_create_layout(ctx, &layout_key, counters, pools)?;
     let render_pass = caches.get_or_create_pass(ctx, pass_key, counters, pools)?;
+    phase.enter(super::draw_phase::Phase::Pipeline);
     // How many viewport slots this draw rasterizes into, checked against the
     // host before it is baked into a pipeline. Refused rather than clamped:
     // clamping would silently drop the viewports past the host's limit, which
@@ -1954,68 +2225,69 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some(mode) => Some(crate::backend::vulkan::translate::raster::vk_query_control_flags(mode)),
     };
-    let pipeline_key = PipelineKey {
-        vert: vert_digest,
-        frag: frag_digest,
-        attrs: attr_keys,
-        topology: req.primitive_topology,
-        blend: req.blend.map(|b| b.key()),
-        secondary_blend: {
-            let mut per_slot = [None; MAX_SECONDARY_ATTACH];
-            for (slot, target) in req
-                .secondary_targets
-                .iter()
-                .take(MAX_SECONDARY_ATTACH)
-                .enumerate()
-            {
-                per_slot[slot] = target.blend.map(|b| b.key());
-            }
-            per_slot
-        },
-        color_write_mask: {
-            let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
-            per_slot[0] = req.color_write_mask;
-            for (slot, target) in req
-                .secondary_targets
-                .iter()
-                .take(MAX_SECONDARY_ATTACH)
-                .enumerate()
-            {
-                per_slot[slot + 1] = target.color_write_mask;
-            }
-            per_slot
-        },
-        pass: pass_key,
-        cull_mode: req.cull_mode,
-        front_face_ccw: req.front_face_ccw,
-        fill_mode: req.fill_mode,
-        depth_clip: req.depth_clip,
-        depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
-        depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
-        depth_compare: req
-            .depth
-            .as_ref()
-            .map(|d| d.compare)
-            .unwrap_or(super::types::SamplerCompareFunction::Always),
-        stencil: req
-            .depth
-            .as_ref()
-            .and_then(|d| d.stencil)
-            .map(|s| super::caches::StencilKey {
-                front: s.front,
-                back: s.back,
+    let pipeline_key =
+        PipelineKey {
+            vert: vert_digest,
+            frag: frag_digest,
+            attrs: attr_keys,
+            topology: req.primitive_topology,
+            blend: req.blend.map(|b| b.key()),
+            secondary_blend: {
+                let mut per_slot = [None; MAX_SECONDARY_ATTACH];
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot] = target.blend.map(|b| b.key());
+                }
+                per_slot
+            },
+            color_write_mask: {
+                let mut per_slot = [ColorWriteMask::default(); 1 + MAX_SECONDARY_ATTACH];
+                per_slot[0] = req.color_write_mask;
+                for (slot, target) in req
+                    .secondary_targets
+                    .iter()
+                    .take(MAX_SECONDARY_ATTACH)
+                    .enumerate()
+                {
+                    per_slot[slot + 1] = target.color_write_mask;
+                }
+                per_slot
+            },
+            pass: pass_key,
+            cull_mode: req.cull_mode,
+            front_face_ccw: req.front_face_ccw,
+            fill_mode: req.fill_mode,
+            depth_clip: req.depth_clip,
+            depth_test: req.depth.as_ref().map(|d| d.test_enable).unwrap_or(false),
+            depth_write: req.depth.as_ref().map(|d| d.write_enable).unwrap_or(false),
+            depth_compare: req
+                .depth
+                .as_ref()
+                .map(|d| d.compare)
+                .unwrap_or(super::types::SamplerCompareFunction::Always),
+            stencil: req.depth.as_ref().and_then(|d| d.stencil).map(|s| {
+                super::caches::StencilKey {
+                    front: s.front,
+                    back: s.back,
+                }
             }),
-        viewport_slots: slot_count_u32,
-        layout: layout_key.clone(),
-    };
+            viewport_slots: slot_count_u32,
+            layout: layout_key.clone(),
+        };
     // One cache, consulted once. `get_or_create_pipeline` already counts the hit
     // and already checks the negative entry for a key that failed to compile.
+    phase.enter(super::draw_phase::Phase::PipelineCompile);
     let pipeline = caches.get_or_create_pipeline(
         ctx,
         &pipeline_key,
         vert_module,
         &req.vert_spirv,
         frag_module,
+        &req.frag_spirv,
         pipeline_layout,
         render_pass,
         counters,
@@ -2023,6 +2295,7 @@ pub(crate) unsafe fn execute_draw_inner(
     )?;
 
     // Samplers
+    phase.enter(super::draw_phase::Phase::PipelineSampler);
     let mut sampler_handles = Vec::new();
     for s in &req.samplers {
         let h = caches.get_or_create_sampler(ctx, &s.state_key(), counters, pools)?;
@@ -2139,7 +2412,61 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     // Target seed staging (CPU import only — not LoadFromTarget).
-    let seed_slot = if let Some(rgba8) = seed_bytes {
+    //
+    // A seed is always eight bits per channel; the attachment need not be. A
+    // buffer→image copy converts nothing and reads the *image's* texel width
+    // per pixel, so staging an RGBA8 seed under a wider attachment would read
+    // past the slot and seed the frame with whatever followed it. The wide arm
+    // below restates the seed as the attachment's texels first; the four-byte
+    // arm is unchanged, which is every attachment this device had until render
+    // targets began following the guest's declared format.
+    let seed_wide = seed_bytes.and_then(|rgba8| {
+        let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format)?;
+        if layout.bytes_per_texel() == crate::contract::pixel_format::RGBA8_BPP {
+            return None;
+        }
+        Some((rgba8, layout))
+    });
+    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+        // The seed's own order first, because `expand_rgba8_to_texel` reads
+        // semantic RGBA8 — the same normalization the four-byte arm folds into
+        // its copy, done here as a step because a widening pass cannot also
+        // exchange in place.
+        let mut semantic;
+        let src = if matches!(req.target_seed_order, SeedOrder::Bgra8) {
+            semantic = rgba8.to_vec();
+            for px in semantic.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+            &semantic[..]
+        } else {
+            rgba8
+        };
+        let pixels = req.width.saturating_mul(req.height);
+        let mut wide = vec![0u8; (pixels as usize) * (layout.bytes_per_texel() as usize)];
+        if !crate::contract::pixel_format::expand_rgba8_to_texel(layout, src, pixels, &mut wide) {
+            return Err(DrawError::DrawExecution(
+                DrawExecutionDecline::SeedFormatUnwritable {
+                    format: color0_format,
+                },
+            ));
+        }
+        let slot = {
+            let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
+            pools.acquire_staging(
+                ctx,
+                wide.len() as u64,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                counters,
+            )?
+        };
+        {
+            let _s = stage_phase::Span::moving(stage_phase::Part::Bytes, wide.len() as u64);
+            pools.write_staging(ctx, &slot, &wide)?;
+        }
+        counters.note_seed_upload(wide.len() as u64);
+        Some(slot)
+    } else if let Some(rgba8) = seed_bytes {
         let slot = {
             let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
             pools.acquire_staging(
@@ -2182,10 +2509,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // and the fetch-carrying `render_pass` is used only for the ad-hoc
     // framebuffer + pipeline, exactly like MRT/depth.
     phase.enter(super::draw_phase::Phase::StagePass);
-    let primary_pass = if is_mrt || req.depth.is_some() || req.color_input {
+    // Whether this draw's pass shape differs from the colour-only one the target
+    // slot's cached framebuffer was built against. One predicate, because the
+    // two answers it feeds have to agree: which pass the slot is ensured under,
+    // and whether the draw builds (and later disposes) a framebuffer of its own.
+    let ad_hoc_framebuffer = is_mrt || req.depth.is_some() || req.color_input;
+    let primary_pass = if ad_hoc_framebuffer {
         caches.get_or_create_pass(
             ctx,
-            PassKey::single(pass_key.load_seed, pass_key.bgra),
+            PassKey::single(pass_key.load_seed, pass_key.color0_format),
             counters,
             pools,
         )?
@@ -2199,8 +2531,7 @@ pub(crate) unsafe fn execute_draw_inner(
         super::types::TargetIdentity,
         vk::Image,
         super::pools::ResidentAccess,
-    )> =
-        Vec::new();
+    )> = Vec::new();
     // This draw's depth attachment, when it has one. The framebuffer is always
     // this draw's own and is always disposed after submit; the image behind it
     // is only owned here when the pass named no guest depth texture to key a
@@ -2236,7 +2567,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 req.height,
                 primary_pass,
                 gen,
-                output_bgra,
+                color0_format,
                 counters,
             )?;
             if load_uses_gpu_content && !t.content_ready {
@@ -2250,29 +2581,16 @@ pub(crate) unsafe fn execute_draw_inner(
             let primary_view = t.view;
             let primary_access = t.access;
             let primary_slot_fb = t.framebuffer;
-            if is_mrt {
-                // Ensure each secondary resident and collect its view for the MRT
-                // framebuffer. Recently-ensured residents sit at the back of the
-                // LRU order, so a later secondary's capacity sweep (front-first)
-                // cannot evict the primary or an earlier secondary in this draw.
-                let mut views = vec![primary_view];
-                for sec in &req.secondary_targets {
-                    let old_access = pools
-                        .registry_get(&sec.identity)
-                        .map(|s| s.access)
-                        .unwrap_or(super::pools::ResidentAccess::Untouched);
-                    let (img, view) = pools.registry_ensure_attachment(
-                        ctx,
-                        sec.identity.clone(),
-                        sec.width,
-                        sec.height,
-                        sec.identity.generation(),
-                        sec.format,
-                        counters,
-                    )?;
-                    views.push(view);
-                    mrt_secondaries.push((sec.identity.clone(), img, old_access));
-                }
+            if ad_hoc_framebuffer {
+                let views = ad_hoc_attachment_views(
+                    ctx,
+                    pools,
+                    counters,
+                    req,
+                    primary_view,
+                    depth_attachment.as_ref().map(|d| d.view),
+                    &mut mrt_secondaries,
+                )?;
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
@@ -2281,30 +2599,9 @@ pub(crate) unsafe fn execute_draw_inner(
                     req.height,
                     counters,
                 )?;
-                (primary_image, fb, primary_access, primary_view)
-            } else if let Some(d) = depth_attachment.as_ref() {
-                let fb = pools.create_mrt_framebuffer(
-                    ctx,
-                    render_pass,
-                    &[primary_view, d.view],
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
-                transient_depth = Some((d.owned, fb));
-                (primary_image, fb, primary_access, primary_view)
-            } else if req.color_input {
-                // Fetch pass carries an input reference → the slot's cached
-                // color-only framebuffer is incompatible; build an ad-hoc one
-                // against `render_pass` (disposed deferred after submit).
-                let fb = pools.create_mrt_framebuffer(
-                    ctx,
-                    render_pass,
-                    &[primary_view],
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
+                if let Some(d) = depth_attachment.as_ref() {
+                    transient_depth = Some((d.owned, fb));
+                }
                 (primary_image, fb, primary_access, primary_view)
             } else {
                 (primary_image, primary_slot_fb, primary_access, primary_view)
@@ -2316,33 +2613,44 @@ pub(crate) unsafe fn execute_draw_inner(
                 with_transfer_dst: seed_bytes.is_some(),
             };
             // Acquire the pooled slot under the color-only `primary_pass` (same as
-            // its cached framebuffer). For a depth draw, build a fresh ad-hoc
-            // framebuffer [color, depth] under the depth `render_pass`.
+            // its cached framebuffer), and build the draw's own framebuffer under
+            // `render_pass` whenever the two pass shapes differ.
             let t = pools.acquire_target(ctx, target_key, primary_pass, counters)?;
             let (pool_image, pool_view, pool_fb) = (t.image, t.view, t.framebuffer);
-            if let Some(d) = depth_attachment.as_ref() {
+            if ad_hoc_framebuffer {
+                let views = ad_hoc_attachment_views(
+                    ctx,
+                    pools,
+                    counters,
+                    req,
+                    pool_view,
+                    depth_attachment.as_ref().map(|d| d.view),
+                    &mut mrt_secondaries,
+                )?;
                 let fb = pools.create_mrt_framebuffer(
                     ctx,
                     render_pass,
-                    &[pool_view, d.view],
+                    &views,
                     req.width,
                     req.height,
                     counters,
                 )?;
-                transient_depth = Some((d.owned, fb));
-                (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
-            } else if req.color_input {
-                let fb = pools.create_mrt_framebuffer(
-                    ctx,
-                    render_pass,
-                    &[pool_view],
-                    req.width,
-                    req.height,
-                    counters,
-                )?;
-                (pool_image, fb, super::pools::ResidentAccess::Untouched, pool_view)
+                if let Some(d) = depth_attachment.as_ref() {
+                    transient_depth = Some((d.owned, fb));
+                }
+                (
+                    pool_image,
+                    fb,
+                    super::pools::ResidentAccess::Untouched,
+                    pool_view,
+                )
             } else {
-                (pool_image, pool_fb, super::pools::ResidentAccess::Untouched, pool_view)
+                (
+                    pool_image,
+                    pool_fb,
+                    super::pools::ResidentAccess::Untouched,
+                    pool_view,
+                )
             }
         };
     // GPU seed source: resolved after registry_ensure (which protects it from
@@ -2595,7 +2903,15 @@ pub(crate) unsafe fn execute_draw_inner(
     }
 
     phase.enter(super::draw_phase::Phase::AcquireReadback);
-    let rb_size = (req.width as u64) * (req.height as u64) * 4;
+    // Sized by the attachment's own texel, not by a constant four. The copy at
+    // the end of this command buffer names an image extent and no buffer row
+    // length, so the GPU writes `width * height *
+    // bytes_per_texel(color0_format)` bytes into this slot — a wide attachment
+    // over a four-byte slot is a device-side write past the slot, not a short
+    // read. The seed path above answers the same question on the way in, and
+    // states the same reason.
+    let rb_texel = u64::from(super::readback_bytes_per_texel(color0_format));
+    let rb_size = (req.width as u64) * (req.height as u64) * rb_texel;
     let do_readback = !req.skip_readback;
     phase.note_target(req.width, req.height, if do_readback { rb_size } else { 0 });
     let readback = if do_readback {
@@ -2691,16 +3007,15 @@ pub(crate) unsafe fn execute_draw_inner(
     // A batch joiner's CB is already recording (opened by the batch opener);
     // its commands append after the previous draw's end_render_pass.
     if !joins {
-        ctx.device
-            .reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecResetCb, e)))?;
-        ctx.device
-            .begin_command_buffer(
+        unsafe {
+            pools.begin_slot_recording(
+                ctx,
                 cb,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecBeginCb, e)))?;
+                super::gpu_span::Kind::Draw,
+                VkOp::ExecResetCb,
+                VkOp::ExecBeginCb,
+            )?
+        };
     }
 
     // Metal permits a pass to sample the same texture it renders into. Vulkan
@@ -2782,7 +3097,8 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
-        let (src_stage, src_access) = target_prior_access(target_snapshotted, target_access).source_scope();
+        let (src_stage, src_access) =
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -2939,7 +3255,8 @@ pub(crate) unsafe fn execute_draw_inner(
         // A pooled or freshly created target tracks `UNDEFINED` — nothing has
         // touched it, so it is excluded rather than barriered, which keeps this
         // off the pooled path entirely.
-        let (src_stage, src_access) = target_prior_access(target_snapshotted, target_access).source_scope();
+        let (src_stage, src_access) =
+            target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::MemoryBarrier::default()
             .src_access_mask(src_access)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)];
@@ -3032,9 +3349,37 @@ pub(crate) unsafe fn execute_draw_inner(
     // a barrier before the draw reads them, which follows the loop — one for
     // all of them, because a per-buffer barrier would submit N of them to
     // express the same dependency.
-    for gather in &guest_gathers {
-        for (source, copies) in &gather.sources {
-            ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies);
+    //
+    // Either form lands byte-identical bytes; which one ran decides only this
+    // barrier's source scope, and `buffer_gather_dispatches` says which it was.
+    let gather_dispatched = if guest_gathers.is_empty() || !compute_gather_enabled() {
+        false
+    } else {
+        match unsafe { plan_buffer_gather_dispatches(ctx, pools, counters, &guest_gathers) }? {
+            Some(groups) => {
+                let pipeline = unsafe { pools.scatter_pipeline(ctx) }
+                    .expect("planned only after the pipeline was created");
+                // Bound once for the run: `record` is 39 % of a dispatch's
+                // cost and this was one of its four driver calls, repeated for
+                // a handle that never changes.
+                unsafe { pipeline.bind(&ctx.device, cb) };
+                for g in &groups {
+                    let _r = super::gather_phase::Span::open(super::gather_phase::Part::Record);
+                    unsafe { pipeline.dispatch(&ctx.device, cb, g.set, g.run_count) };
+                }
+                counters
+                    .buffer_gather_dispatches
+                    .fetch_add(groups.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                true
+            }
+            None => false,
+        }
+    };
+    if !gather_dispatched {
+        for gather in &guest_gathers {
+            for (source, copies) in &gather.sources {
+                ctx.device.cmd_copy_buffer(cb, *source, gather.dst, copies);
+            }
         }
     }
     if !guest_gathers.is_empty() {
@@ -3049,8 +3394,24 @@ pub(crate) unsafe fn execute_draw_inner(
         // sampled window gathers into one of these slots and is then read by the
         // buffer→image copy below, which is a transfer and not a graphics stage.
         // Without it that copy races the gather that fills it.
+        //
+        // The source scope follows whichever form ran, and only that form: a
+        // barrier naming both would be correct but would say the copies might
+        // have been a compute write on a boot where they were not, which is a
+        // dependency the driver then has to honour for nothing.
+        let (src_stage, src_access) = if gather_dispatched {
+            (
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::AccessFlags::SHADER_WRITE,
+            )
+        } else {
+            (
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::TRANSFER_WRITE,
+            )
+        };
         let barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_access_mask(src_access)
             .dst_access_mask(
                 vk::AccessFlags::VERTEX_ATTRIBUTE_READ
                     | vk::AccessFlags::INDEX_READ
@@ -3060,7 +3421,7 @@ pub(crate) unsafe fn execute_draw_inner(
             )];
         ctx.device.cmd_pipeline_barrier(
             cb,
-            vk::PipelineStageFlags::TRANSFER,
+            src_stage,
             vk::PipelineStageFlags::ALL_GRAPHICS | vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
             &barrier,
@@ -3285,6 +3646,61 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_query(cb, pool, 0);
     }
     ctx.device.cmd_end_render_pass(cb);
+    if layout_churn_probe_enabled() {
+        // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One extra round trip of the
+        // colour attachment's layout, out of `TRANSFER_SRC_OPTIMAL` and back
+        // into it, recorded where the pass has just left it there.
+        //
+        // It exists to price what this device already pays twice a draw and has
+        // never measured. Every draw that loads its target barriers it from
+        // `TRANSFER_SRC_OPTIMAL` to `COLOR_ATTACHMENT_OPTIMAL` on the way in, and
+        // every render pass puts it back through `final_layout` on the way out —
+        // so a run of draws into one target transitions a full-size image twice
+        // per draw for no reader. On hardware that keeps colour compression
+        // metadata, moving an image to a transfer layout is a resolve over the
+        // whole attachment; on hardware that does not, it is free. Which of those
+        // this is decides whether that pair is worth removing, and no counter in
+        // this device can tell them apart.
+        //
+        // A positive control rather than a change: the pixels are identical
+        // because both layouts preserve contents and nothing is recorded between
+        // the two barriers, so `us/draw` moving is the cost of two transitions
+        // and nothing else. If it does not move, the pair costs nothing here and
+        // the reading is that this host does not compress what it is asked to
+        // transfer.
+        let out = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &out,
+        );
+        let back = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+    }
 
     if let Some(ref rb) = readback {
         // The pass resolved the colour attachment to TRANSFER_SRC_OPTIMAL, so
@@ -3331,6 +3747,10 @@ pub(crate) unsafe fn execute_draw_inner(
     let defer_submit = batch_eligible;
     phase.enter(super::draw_phase::Phase::Submit);
     if !defer_submit {
+        // Last command before the CB ends, so the stamp bounds every draw and
+        // copy this submission recorded. A deferred draw is sealed by
+        // `batch_flush` instead, on the same slot.
+        unsafe { pools.gpu_span_seal_current(ctx, cb) };
         ctx.device
             .end_command_buffer(cb)
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecEndCb, e)))?;
@@ -3364,8 +3784,8 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     // CPU-side bookkeeping: the retained target's content is queue-ordered
     // (mark ready), resident sampled layouts advance to the recorded
-    // post-draw layout, and upload-path sampled bytes queue for cache
-    // admission at retire time.
+    // post-draw layout, and the sampled images this CB fills are named for the
+    // cache admission that `finish_entry_async` makes below.
     if let Some(identity) = &req.target_identity {
         // How much of the attachment this draw could have written. Nothing in
         // this device acts on it — it is the standing instrument for whether
@@ -3470,16 +3890,19 @@ pub(crate) unsafe fn execute_draw_inner(
             pools.registry_note_access(seed_identity, super::pools::ResidentAccess::TransferRead);
         }
     }
-    // Deferred-submit draw: park the per-draw descriptor set and sampled
-    // admissions on the open batch (opening it if this is the first) and
-    // return. The CPU-side bookkeeping above already ran — content_ready and
-    // tracked layouts describe what the recorded CB produces, and every
-    // consumer path flushes the batch before touching the GPU.
+    // Deferred-submit draw: park the per-draw descriptor set on the open batch
+    // (opening it if this is the first), hand the batch this draw's sampled
+    // images for the content cache, and return. The CPU-side bookkeeping above
+    // already ran — content_ready and tracked layouts describe what the recorded
+    // CB produces, and every consumer path flushes the batch before touching the
+    // GPU. The cache admission happens inside `batch_append` rather than at the
+    // flush precisely so the *next* draw of this batch can find these windows;
+    // see its doc.
     if defer_submit {
         let target = batch_target.expect("batch_eligible requires target identity");
         pools.batch_append(
-            cb,
-            fence,
+            &ctx.device,
+            (cb, fence),
             target,
             dset.zip(dset_pool),
             sampled_retains,
@@ -3504,8 +3927,8 @@ pub(crate) unsafe fn execute_draw_inner(
     // admissions) on this ring slot in every mode; whichever entry retires
     // the slot drains it. A failed wait below leaves the slot pending, so no
     // path ever reuses an unretired fence.
-    let cleanup = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
-    pools.finish_entry_async(cleanup);
+    let sealed = pools.seal_entry(dset.zip(dset_pool).into_iter().collect(), sampled_retains);
+    pools.finish_entry_async(&ctx.device, sealed);
 
     // Dispose the ad-hoc per-draw framebuffers (MRT and/or depth) now that
     // `finish_entry_async` has marked this slot pending: the handles park in
@@ -3513,7 +3936,12 @@ pub(crate) unsafe fn execute_draw_inner(
     // and are freed once those retire. Disposing BEFORE this point would
     // immediate-free them (this slot is not yet pending, so it is not in the
     // open mask) while the just-submitted CB still references them → GPU fault.
-    if is_mrt || (req.color_input && transient_depth.is_none()) {
+    //
+    // `transient_depth` carries the same handle whenever the draw has depth, so
+    // the two arms below are exclusive by that test rather than by re-deriving
+    // which features are in play — a depth MRT draw has one framebuffer and must
+    // dispose it once.
+    if ad_hoc_framebuffer && transient_depth.is_none() {
         pools.dispose(
             &ctx.device,
             super::pools::DeferredHandle::Framebuffer(target_fb),
@@ -3605,9 +4033,26 @@ pub(crate) unsafe fn execute_draw_inner(
     )?;
     counters.note_readback(rb_size);
 
+    // Read at the attachment's width above, narrowed here to the RGBA8 a
+    // `DrawOutput` consumer speaks. Shared with `read_target`'s rail so the two
+    // cannot answer a wide attachment differently — which they did, one
+    // quantizing and one overrunning its slot.
+    let layout = crate::backend::vulkan::translate::pixel::texel_layout_of(color0_format).ok_or(
+        DrawError::TargetRead(super::reason::TargetReadDecline::TexelNotFourBytes {
+            format: color0_format,
+        }),
+    )?;
+    let (pixels, pixels_bgra) = super::narrow_readback_to_rgba8(
+        out,
+        layout,
+        color0_format,
+        (req.width as u64) * (req.height as u64),
+        output_bgra,
+    )?;
+
     Ok(DrawOutput {
-        pixels: out,
-        pixels_bgra: output_bgra,
+        pixels,
+        pixels_bgra,
         occlusion_samples: read_occlusion_samples(ctx, occlusion)?,
     })
 }
@@ -3646,6 +4091,56 @@ fn read_occlusion_samples(
     unsafe { ctx.device.destroy_query_pool(pool, None) };
     read.map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecGetQueryPoolResults, e)))?;
     Ok(Some(samples[0]))
+}
+
+/// The attachment views of a draw's own framebuffer, in the order the render
+/// pass declares them: the primary colour slot, then the secondaries, then
+/// depth.
+///
+/// Three places build a list in this order — the pass's attachment descriptions
+/// in [`ObjectCaches::get_or_create_pass`], the clear vector in [`clear_values`],
+/// and this. Vulkan indexes all three positionally against each other, so a
+/// fourth spelling is a mismatch nothing refuses; there is one call site per
+/// target arm and neither builds its own.
+///
+/// The secondaries are ensured here, after the caller has ensured the primary,
+/// because that order is what protects this draw's own attachments: a resident
+/// just ensured sits at the back of the LRU, so a later secondary's capacity
+/// sweep (which evicts front-first) cannot take the primary or an earlier
+/// secondary out from under the framebuffer being built.
+unsafe fn ad_hoc_attachment_views(
+    ctx: &super::context::DeviceContext,
+    pools: &mut ResourcePools,
+    counters: &EngineCounters,
+    req: &DrawRequest,
+    primary_view: vk::ImageView,
+    depth_view: Option<vk::ImageView>,
+    mrt_secondaries: &mut Vec<(
+        super::types::TargetIdentity,
+        vk::Image,
+        super::pools::ResidentAccess,
+    )>,
+) -> Result<Vec<vk::ImageView>, DrawError> {
+    let mut views = vec![primary_view];
+    for sec in &req.secondary_targets {
+        let old_access = pools
+            .registry_get(&sec.identity)
+            .map(|s| s.access)
+            .unwrap_or(super::pools::ResidentAccess::Untouched);
+        let (img, view) = pools.registry_ensure_attachment(
+            ctx,
+            sec.identity.clone(),
+            sec.width,
+            sec.height,
+            sec.identity.generation(),
+            sec.format,
+            counters,
+        )?;
+        views.push(view);
+        mrt_secondaries.push((sec.identity.clone(), img, old_access));
+    }
+    views.extend(depth_view);
+    Ok(views)
 }
 
 /// One `VkClearValue` per attachment, in framebuffer order: the primary colour
@@ -3837,6 +4332,8 @@ mod tests {
             cpu_seed: b(7),
             gpu_seed: b(8),
             no_open_batch: b(9),
+            batch_full: b(10),
+            target_switch: b(11),
         }
     }
 
@@ -4125,20 +4622,21 @@ mod tests {
                 volume: false,
                 cube: false,
                 one_dim: false,
-                source: SampledSource::GuestRuns(GuestRunSource {
-                    runs: std::sync::Arc::new(vec![GuestRun {
-                        host_ptr: 0x1000,
-                        len: total_len,
-                    }]),
-                    total_len,
-                    row_length_texels,
-                    // A fixture over a dummy host address names no guest
-                    // RAM, so there is no reference an import could bind.
-                    pages: None,
-                },
-                // No witness ran for a synthetic source, so nothing vouches:
-                // the gather is the only disposition this fixture can take.
-                crate::runtime::gather_witness::GatherVouch::Fresh,
+                source: SampledSource::GuestRuns(
+                    GuestRunSource {
+                        runs: std::sync::Arc::new(vec![GuestRun {
+                            host_ptr: 0x1000,
+                            len: total_len,
+                        }]),
+                        total_len,
+                        row_length_texels,
+                        // A fixture over a dummy host address names no guest
+                        // RAM, so there is no reference an import could bind.
+                        pages: None,
+                    },
+                    // No witness ran for a synthetic source, so nothing vouches:
+                    // the gather is the only disposition this fixture can take.
+                    crate::runtime::gather_witness::GatherVouch::Fresh,
                 ),
                 format: crate::backend::vulkan::translate::pixel::vk_texel_layout(
                     crate::contract::pixel_format::TexelLayout::Bgra8,
@@ -4228,7 +4726,10 @@ mod tests {
                     vk::PipelineStageFlags::TOP_OF_PIPE,
                     "{access:?} names a prior access, so skipping its barrier drops a dependency"
                 );
-                assert!(!flags.is_empty(), "{access:?} has an access to make available");
+                assert!(
+                    !flags.is_empty(),
+                    "{access:?} has an access to make available"
+                );
             }
         }
     }
@@ -4242,6 +4743,7 @@ mod tests {
                 width: 16,
                 height: 16,
                 generation: 1,
+                format: crate::backend::vulkan::translate::pixel::SCANOUT_FORMAT,
             },
             width: 16,
             height: 16,
@@ -4678,7 +5180,11 @@ mod depth_load_tests {
     fn the_transient_depth_rail_never_honours_a_load() {
         let transient = AcquiredDepth {
             view: vk::ImageView::null(),
-            owned: Some((vk::Image::null(), vk::DeviceMemory::null(), vk::ImageView::null())),
+            owned: Some((
+                vk::Image::null(),
+                vk::DeviceMemory::null(),
+                vk::ImageView::null(),
+            )),
             identity: None,
             content_ready: false,
         };

@@ -152,6 +152,33 @@ engine_counters! {
         allocs,
         shader_hits,
         shader_misses,
+        /// SPIR-V words walked by [`super::caches::Caches::get_or_create_shader`]
+        /// before it can look anything up, summed over every call including the
+        /// hits.
+        ///
+        /// Keying a module by its contents means the key costs a pass over the
+        /// contents, and this device asks for two of them — the storage-image
+        /// capability derivation and the digest — on every draw, for both stages,
+        /// whether or not the module is already cached. `shader_hits` alone reads
+        /// as a working cache and says nothing about that, the same way
+        /// `sampled_cache_hits` read as working until `sampled_cache_hit_bytes`
+        /// priced it: a hit over a 2 KiB module and a hit over an 88 KiB one are
+        /// the same count and forty times the work.
+        ///
+        /// Divided by the census window this is a bandwidth, which is the form
+        /// that can be compared against what a hashing pass over memory costs.
+        shader_hash_words,
+        /// `shader_hits` that never walked the module at all, because
+        /// `get_or_create_shader_memoized` recognised the allocation its words
+        /// live in and already knew the digest.
+        ///
+        /// Read as a *fraction of* `shader_hits`, which is the only form that
+        /// says anything: the two together are the front index's hit rate, and
+        /// `shader_hash_words` beside them is what the walks that remain cost.
+        /// A boot where this sits well below `shader_hits` has a draw path
+        /// handing the walking form an allocation it does not hold — which is a
+        /// correctness-neutral regression that nothing else would report.
+        shader_digest_hits,
         layout_hits,
         layout_misses,
         pass_hits,
@@ -396,6 +423,26 @@ engine_counters! {
         buffer_guest_gathers,
         buffer_guest_gather_bytes,
         buffer_guest_gather_regions,
+        /// Compute dispatches the buffer gather issued in place of those
+        /// regions, and the plans that could not become one.
+        ///
+        /// **`buffer_guest_gather_regions` above counts regions *planned*, not
+        /// issued**, because it is charged where the window is planned and
+        /// before either form is chosen. A dispatch boot therefore still reports
+        /// ~245 000 of them while issuing none — do not read that column as
+        /// transfer traffic. It is a property of the workload (how scattered the
+        /// guest's buffers are) and stays comparable across the two arms and
+        /// across builds, which is what makes it useful; it is simply not the
+        /// column that says which form ran.
+        ///
+        /// **This one is.** `dispatches > 0` means the dispatch path ran for the
+        /// whole batch; `declined > 0` means a window's arithmetic was refused
+        /// and every gather in that command buffer took the transfer regions,
+        /// which is all-or-nothing because the two forms need different
+        /// barriers. Both zero on a boot with gathers means the switch is off or
+        /// the host cannot import.
+        buffer_gather_dispatches,
+        buffer_gather_declined,
         /// Buffer binds served from a copy the command buffer being recorded
         /// already holds — see `ResourcePools::cb_bound_buffers`.
         ///
@@ -486,6 +533,24 @@ engine_counters! {
         /// window is ~507 stretches, so ~507 here means every frame took the
         /// linear path and ~1500 means none did.
         guest_write_regions,
+        /// Compute dispatches submitted by the linear path's scatter, one per
+        /// destination buffer.
+        ///
+        /// Read against `guest_write_linear`, which it equals on an ordinary
+        /// one-RAMBlock machine where every linear writeback dispatched. The
+        /// pair with `guest_write_regions` is the whole reading: a boot on the
+        /// dispatch reads ~1 region per linear writeback (the detile) and ~1
+        /// dispatch, where one on the transfer scatter reads ~507 regions and
+        /// zero.
+        guest_write_dispatches,
+        /// Linear writebacks that planned a dispatch, could not, and took the
+        /// transfer regions.
+        ///
+        /// A healthy zero. Any firing is a run whose geometry the kernel cannot
+        /// express or a window wider than the driver binds, and each one is a
+        /// whole frame on the expensive path — the fail-channel record names
+        /// which check refused.
+        guest_write_scatter_declined,
     }
 
     cumulative {

@@ -26,25 +26,37 @@ use super::DISPLAY_VBL_MIN_INTERVAL_US;
 /// always-on channel, so "are we starving the display link" could not be
 /// answered from a log, only guessed at from the constants.
 ///
-/// The three arms are counted separately because a single "delivered" tally
-/// cannot tell the two silences apart, and they have opposite meanings:
-/// `not_online` is the display never having come up (no VBL is owed at all),
-/// while `not_claimed` is the limiter doing its job at the advertised rate.
-/// Reading a low delivered count without them would license both conclusions.
+/// The arms are counted separately because a single "delivered" tally cannot
+/// tell the silences apart, and they have opposite meanings: `not_online` is
+/// the display never having come up (no VBL is owed at all), `not_claimed` is
+/// the limiter doing its job at the advertised rate, and `not_enabled` is the
+/// guest having declined this class in the shared page's enable mask. Reading a
+/// low delivered count without them would license all three conclusions.
 ///
-/// One line per 1024 deliveries — about 8 s at the grid rate, and it costs three
-/// relaxed increments per poll otherwise.
+/// `not_enabled` is the arm whose absence cost a reader most, and it was
+/// absent: both x86 rails measured here run with VBL disabled in that mask, and
+/// this line reported `delivered=13312 ... window_hz=120.0` for a guest that
+/// had asked for no VBL at all. That reads as "the compositor is being paced at
+/// the grid rate" when nothing is owed and nothing is being consumed.
+///
+/// One line per 1024 deliveries — about 8 s at the grid rate, and it costs one
+/// relaxed increment per poll otherwise.
 /// Which way the VBL path went. Indices into [`VblCensus`].
 pub(crate) const VBL_NOT_ONLINE: usize = 0;
 pub(crate) const VBL_NOT_CLAIMED: usize = 1;
 pub(crate) const VBL_DELIVERED: usize = 2;
+pub(crate) const VBL_NOT_ENABLED: usize = 3;
 
 /// One report per this many deliveries — about 8 s at the grid rate.
 const VBL_REPORT_EVERY: u64 = 1024;
 
+/// Width of [`VblCensus::arms`], derived from the last arm index so a new arm
+/// cannot be added without the array growing with it.
+const VBL_ARMS: usize = VBL_NOT_ENABLED + 1;
+
 #[derive(Default)]
 pub(crate) struct VblCensus {
-    arms: [std::sync::atomic::AtomicU64; 3],
+    arms: [std::sync::atomic::AtomicU64; VBL_ARMS],
     last_report_ms: std::sync::atomic::AtomicU64,
     last_report_n: std::sync::atomic::AtomicU64,
 }
@@ -53,14 +65,27 @@ impl VblCensus {
     /// Count one traversal and return the line to emit when a report is due.
     ///
     /// Returns the line rather than emitting it so the reporting rule is
-    /// testable without a log sink: the interesting properties are "only
-    /// deliveries report", "the rate is measured over the window and not the
-    /// process lifetime", and "the two silent arms stay separable", and all
+    /// testable without a log sink: the interesting properties are "only the
+    /// post-limiter arms report", "the rate is measured over the window and not
+    /// the process lifetime", and "the silent arms stay separable", and all
     /// three are assertions about this return value.
+    ///
+    /// **Two arms report, not one.** `delivered` and `not_enabled` are the two
+    /// outcomes of a tick that got past the online check and the limiter, and
+    /// exactly one of them can be live on a given boot — the guest either has
+    /// the class enabled or it does not. Reporting only on `delivered` is why a
+    /// guest that declines VBL produced no `display_vbl` line at all, which
+    /// reads identically to a device whose VBL path is not running.
+    ///
+    /// `hz` is the reporting arm's own rate over the window, so it stays a rate
+    /// of the thing that triggered the line; `arm=` names which one, because
+    /// 120 Hz of delivery and 120 Hz of declining are the same number and
+    /// opposite facts.
     pub(crate) fn note(&self, arm: usize, now_ms: u64) -> Option<String> {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.arms[arm].fetch_add(1, Relaxed) + 1;
-        if arm != VBL_DELIVERED || !n.is_multiple_of(VBL_REPORT_EVERY) {
+        let reports = arm == VBL_DELIVERED || arm == VBL_NOT_ENABLED;
+        if !reports || !n.is_multiple_of(VBL_REPORT_EVERY) {
             return None;
         }
         let since_ms = now_ms.saturating_sub(self.last_report_ms.swap(now_ms, Relaxed));
@@ -73,11 +98,18 @@ impl VblCensus {
         } else {
             0.0
         };
+        let name = if arm == VBL_DELIVERED {
+            "delivered"
+        } else {
+            "not_enabled"
+        };
         Some(format!(
-            "display_vbl delivered={n} not_claimed={} not_online={} window_hz={hz:.1} \
-             grid_hz={:.1}",
+            "display_vbl delivered={} not_claimed={} not_online={} not_enabled={} \
+             arm={name} window_hz={hz:.1} grid_hz={:.1}",
+            self.arms[VBL_DELIVERED].load(Relaxed),
             self.arms[VBL_NOT_CLAIMED].load(Relaxed),
             self.arms[VBL_NOT_ONLINE].load(Relaxed),
+            self.arms[VBL_NOT_ENABLED].load(Relaxed),
             1_000_000.0 / DISPLAY_VBL_MIN_INTERVAL_US as f64,
         ))
     }
@@ -87,6 +119,141 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
     static VBL: std::sync::LazyLock<VblCensus> = std::sync::LazyLock::new(VblCensus::default);
     if let Some(line) = VBL.note(arm, now_ms) {
         crate::observe::off(line);
+    }
+}
+
+/// Which way the display present/transaction signal went. Indices into the
+/// counter set behind [`note_display_present_signal`].
+pub(crate) const DISPLAY_PRESENT_NO_GPA: usize = 0;
+pub(crate) const DISPLAY_PRESENT_NOT_ENABLED: usize = 1;
+pub(crate) const DISPLAY_PRESENT_DELIVERED: usize = 2;
+/// Raised by the refresh tick rather than by a present.
+///
+/// Separate from `DELIVERED` because the two answer different questions and
+/// summing them hides both: `delivered` is "a frame finished", `refresh` is "the
+/// pipe was told its live frame is done with". A guest that drives its display
+/// from this class shows a high `refresh` and a low `delivered`; one that never
+/// arms it shows zero of both, and that is not the same reading.
+pub(crate) const DISPLAY_PRESENT_REFRESH: usize = 3;
+
+/// Width of the counter set, derived from the last arm so a new arm cannot be
+/// added without the array growing with it.
+const DISPLAY_PRESENT_ARMS: usize = DISPLAY_PRESENT_REFRESH + 1;
+
+/// One report per this many signals. Presents are far rarer than VBL ticks, so
+/// this is a much smaller stride than [`VBL_REPORT_EVERY`] — a rail that
+/// presents a handful of times a second should still produce a line.
+const DISPLAY_PRESENT_REPORT_EVERY: u64 = 64;
+
+/// Count one traversal of the display present/transaction signal.
+///
+/// **VBL had a census and this edge had none, and they fail differently.** A
+/// starved VBL costs the compositor its pacing, which reads as slowness. A
+/// withheld transaction interrupt can cost liveness outright: the guest's
+/// queue-idle wait has no deadline, so "how many times did this device raise
+/// bit 1, and how many times did it decline to" is the difference between a
+/// device that is merely behind and one the guest will wait on forever. Neither
+/// question had an answer in any log.
+///
+/// `not_enabled` is the arm to read on a rail that is not advancing. It is not a
+/// fault by itself — a guest that has not armed the class is not owed the
+/// event — but paired with `delivered=0` it says the device never had the
+/// opportunity, which is a different bug from having missed it.
+///
+/// **Every arm reports its first traversal, not just its 64th.** A stride alone
+/// is the wrong instrument for a rail that is *stuck*: the interesting readings
+/// here are single digits, and a wedged guest that took an arm three times would
+/// produce no line at all — indistinguishable in the log from a device on which
+/// this edge never runs, which is the exact confusion this census exists to
+/// remove. The stride bounds a busy rail; the first-sight line bounds a dead one.
+pub(crate) fn note_display_present_signal(arm: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static ARMS: [std::sync::atomic::AtomicU64; DISPLAY_PRESENT_ARMS] =
+        [const { std::sync::atomic::AtomicU64::new(0) }; DISPLAY_PRESENT_ARMS];
+    let n = ARMS[arm].fetch_add(1, Relaxed) + 1;
+    if n != 1 && !n.is_multiple_of(DISPLAY_PRESENT_REPORT_EVERY) {
+        return;
+    }
+    crate::observe::off(format!(
+        "display_present_signal delivered={} refresh={} not_enabled={} no_gpa={}",
+        ARMS[DISPLAY_PRESENT_DELIVERED].load(Relaxed),
+        ARMS[DISPLAY_PRESENT_REFRESH].load(Relaxed),
+        ARMS[DISPLAY_PRESENT_NOT_ENABLED].load(Relaxed),
+        ARMS[DISPLAY_PRESENT_NO_GPA].load(Relaxed),
+    ));
+}
+
+/// Sentinel for "no enable word has been read yet".
+///
+/// The mask is four meaningful bits, so any value with a high bit set is
+/// unreachable as a real reading and a first read of `0` still reports.
+const DISPLAY_ENABLE_UNREAD: u32 = u32::MAX;
+
+/// Report the guest's display event-enable word, once per distinct value.
+///
+/// **Which classes a guest arms is a per-generation decision, and it is the
+/// first thing worth knowing about a display pipe that is not advancing.** The
+/// word lives in guest RAM and is never trapped, so the only way to see it used
+/// to be to stop the world and read the page by hand over QMP — which is how it
+/// was read, per rail, one sample at a time. A sample is also the wrong shape:
+/// the guest arms VBL while compositing and disarms when idle, so a single
+/// reading cannot distinguish "never armed" from "not armed just now", and those
+/// are the two answers a stalled rail is being triaged between.
+///
+/// Edge-triggered rather than sampled for that reason: one line per transition
+/// costs nothing on a steady guest and yields the arm/disarm history on a busy
+/// one. `first_sight` cannot serve here — it keys on the formatted line, so a
+/// mask that flips between two values would report each exactly once and then go
+/// quiet, losing the very history this exists to show.
+pub(crate) fn note_display_enable_mask(mask: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU32 =
+        std::sync::atomic::AtomicU32::new(DISPLAY_ENABLE_UNREAD);
+    let prev = LAST.swap(mask, Relaxed);
+    if prev == mask {
+        return;
+    }
+    // Name every bit the guest's dispatch can claim, and say plainly when it has
+    // armed one this device never signals. A reader looking at `0xe` should not
+    // have to go and find out what bit 3 is; that question cost a session.
+    let names = |m: u32| -> String {
+        use crate::model::{
+            DISPLAY_EVENT_MASK_ALL, DISPLAY_OFFLINE_EVENT_MASK, DISPLAY_ONLINE_EVENT_MASK,
+            DISPLAY_PRESENT_EVENT_MASK, DISPLAY_VBL_EVENT_MASK,
+        };
+        let mut out = Vec::new();
+        for (bit, name) in [
+            (DISPLAY_VBL_EVENT_MASK, "vbl"),
+            (DISPLAY_PRESENT_EVENT_MASK, "transaction"),
+            (DISPLAY_ONLINE_EVENT_MASK, "online"),
+            (DISPLAY_OFFLINE_EVENT_MASK, "offline"),
+        ] {
+            if m & bit != 0 {
+                out.push(name);
+            }
+        }
+        // A bit outside the guest's own dispatch would sit in the pending word
+        // forever, so an unknown one is worth naming loudly rather than dropping.
+        if m & !DISPLAY_EVENT_MASK_ALL != 0 {
+            out.push("unknown");
+        }
+        if out.is_empty() {
+            "none".to_string()
+        } else {
+            out.join("+")
+        }
+    };
+    if prev == DISPLAY_ENABLE_UNREAD {
+        crate::observe::off(format!(
+            "display_enable_mask first mask=0x{mask:x} armed={}",
+            names(mask)
+        ));
+    } else {
+        crate::observe::off(format!(
+            "display_enable_mask 0x{prev:x} -> 0x{mask:x} armed={} was={}",
+            names(mask),
+            names(prev)
+        ));
     }
 }
 
@@ -318,6 +485,282 @@ impl ReadbackPhase {
             ReadbackPhase::Write => "write",
             ReadbackPhase::Vouch => "vouch",
             ReadbackPhase::Resolve => "resolve",
+        }
+    }
+}
+
+/// Which part of `process_exec_indirect2` a span was spent in.
+///
+/// One opcode carries the whole dispatch: the per-opcode split of `proc_us` puts
+/// `CHILD_OP_EXEC_INDIRECT2` at **754-775 ms/s** against **under 3.3 ms/s for
+/// the eleven other opcodes combined**. `draw_us` names 585 ms/s of that, and it
+/// names it narrowly — `DrainPhase::Draw` wraps `encode_draw_chain` alone,
+/// inside the per-draw loop. **The remaining ~197 ms/s is the whole of the drain
+/// residue that is left**, and no span reaches it.
+///
+/// These five tile the function rather than nominate a part of it, which is the
+/// method that worked on the child-FIFO loop after nominating one twice did not.
+/// [`Self::Header`] is deliberately the leftover: it is timed as the function's
+/// total minus the other four, so a cost in a corner nobody listed still lands
+/// somewhere and the sum still equals `op0x37_us`.
+///
+/// # What it measured, driven macos-13, 74 windows
+///
+/// `sum` against `op0x37_us` is **0.999**, so the tiling closes and the split is
+/// arithmetic:
+///
+/// ```text
+/// finish     639.6 ms/s   (contains draw_us)
+/// preflight   74.6 ms/s   <- the largest span outside the encode
+/// walk        45.7 ms/s
+/// header       6.7 ms/s
+/// load         3.7 ms/s
+/// finish - draw  ~26 ms/s
+/// ```
+///
+/// **The largest non-draw cost in this device is the speculative preflight**, at
+/// ~10 % of the whole drain worker. `Load` is 2 % — a structural read had
+/// nominated the per-command-buffer allocation and GVA copy as the likely
+/// dominant cost, and it is not, which is the third nomination this tiling has
+/// retired. `Header` being small is the reassuring reading: the cost is in spans
+/// that were named rather than in a corner nobody listed.
+///
+/// On a host with no host-pointer import (`REIMS_VGPU_GUEST_IMPORT=off`, two
+/// boots) the shape changes and only in the expected place: `finish` rises to
+/// 811-821 ms/s while `preflight` *falls* to 39-40, because that arm runs at
+/// less than half the packet rate. The whole difference is the writeback copies,
+/// which is the copying rail working rather than a regression.
+#[derive(Clone, Copy)]
+pub enum ExecPhase {
+    /// The command-buffer load loop: one `vec![0u8; len]` and one
+    /// `read_task_gva_by_id` per command buffer, each a GVA resolve and a copy
+    /// out of guest memory. Sized by the guest, so a multi-MiB stream is a
+    /// multi-MiB allocation and copy on the drain thread.
+    Load,
+    /// The speculative translation preflight: scans each stream for RENDER and
+    /// COMPUTE pipeline refs and asks whether metal2vulkan has them, so a packet
+    /// can be deferred whole rather than half-executed.
+    Preflight,
+    /// `walk_stream`: decoding every record of every segment and applying the
+    /// bind bookkeeping, which is where `render::decode` and `apply_binds` run.
+    /// The inner loop of the whole device.
+    Walk,
+    /// `finish_stream`: clears, ICB executes, the draw list, and the per-draw
+    /// loop. **Contains `draw_us`**, which names itself, so `Finish` minus
+    /// `draw_us` is the per-draw setup and result handling around the encode.
+    Finish,
+    /// Everything else the function does — header and payload validation, the
+    /// resource-table decode, `consume_resource_table`, and any path that
+    /// returns early. Derived rather than measured directly, so the five sum to
+    /// the function's own total by construction.
+    Header,
+}
+
+impl ExecPhase {
+    /// How many phases there are. The census arrays are sized from this, so a
+    /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
+    /// than overflowing an array at report time.
+    pub(crate) const COUNT: usize = 5;
+
+    const ALL: [ExecPhase; Self::COUNT] = [
+        ExecPhase::Load,
+        ExecPhase::Preflight,
+        ExecPhase::Walk,
+        ExecPhase::Finish,
+        ExecPhase::Header,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            ExecPhase::Load => 0,
+            ExecPhase::Preflight => 1,
+            ExecPhase::Walk => 2,
+            ExecPhase::Finish => 3,
+            ExecPhase::Header => 4,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            ExecPhase::Load => "load",
+            ExecPhase::Preflight => "preflight",
+            ExecPhase::Walk => "walk",
+            ExecPhase::Finish => "finish",
+            ExecPhase::Header => "header",
+        }
+    }
+}
+
+/// Which part of the translation preflight a span was spent in.
+///
+/// [`ExecPhase::Preflight`] is **74.6 ms/s, the largest cost in this device
+/// outside the draw encode**, and it is speculative work: it re-derives, per
+/// exec packet, whether metal2vulkan already holds every pipeline the streams
+/// reference. Three unlike things happen in there and the aggregate cannot say
+/// which one costs, which is exactly the shape `RegsOp` was added for after the
+/// same mistake.
+///
+/// The three sum to `preflight_us`, so the identity is checkable on the line.
+/// It reads ~0.95 rather than 1.00 because the `extract_air` calls that sit
+/// between the `Air` and `Cache` spans are outside both.
+///
+/// # What it measured, two driven macos-13 boots
+///
+/// ```text
+/// air      53.90 / 54.23 ms/s    4.34 / 4.30 us per pipeline ref   <- 71 %
+/// cache    16.30 / 16.60 ms/s    1.30 / 1.31 us per pipeline ref
+/// refs      6.24 / 6.23 ms/s     0.41 / 0.40 us per call
+/// pipes/s  12 650 / 12 786
+/// ```
+///
+/// `Refs` — the second full decode of the stream, the part most obviously
+/// redundant since `walk_stream` decodes the same records straight afterwards —
+/// is **8 %**. The cost is `Air`, and *within* `Air` it is the three
+/// guest-memory resolves rather than the AIR copies: removing both copies moved
+/// `air_us/pipe` by only 4.7 %.
+///
+/// # The lever that is left, and why it is soundable
+///
+/// The remaining ~50 ms/s comes off only by **not resolving at all** — a memo of
+/// `(task_id, pipeline_ref)` already confirmed translated.
+///
+/// What makes that keepable-sound is that **the m2v cache is unbounded and
+/// nothing evicts it**: its sole removal is `forget_if_transient`, which drops a
+/// transient *failure* so it can be retried. An `Entry::Ready` stays Ready for
+/// the life of the process, so the only staleness is the guest repointing a ref
+/// at different AIR — which the object-deletion paths already hook.
+///
+/// The failure mode is bounded but **not free**, which is why it has not been
+/// rushed in: `translate_cached_reflected` falls through to a *synchronous*
+/// translate on a miss, so a stale memo does not lose guest work — it runs an
+/// AIR-to-SPIR-V translation inline on the drain thread while the device lock is
+/// held, which is exactly what the asynchronous preflight exists to avoid.
+/// Design the invalidation against the deletion paths before taking the memo.
+#[derive(Clone, Copy)]
+pub enum PreflightPart {
+    /// Collecting the distinct pipeline refs: `iter_segments` and a full
+    /// `render::decode` / `compute::decode` of every record in the stream — the
+    /// *same* walk `walk_stream` is about to make, done a second time because
+    /// the answer has to be complete before any record runs.
+    Refs,
+    /// `load_render_air_pair` and its compute counterpart: resolving each
+    /// pipeline's AIR out of guest memory.
+    Air,
+    /// `m2v_cache::ensure_cached_async`, which digests the whole AIR blob to
+    /// build the key and then takes the cache's global lock. Twice per render
+    /// pipeline, once per kernel.
+    Cache,
+}
+
+impl PreflightPart {
+    /// How many parts there are. The census arrays are sized from this, so a new
+    /// variant that forgets to bump it fails to build [`Self::ALL`] rather than
+    /// overflowing an array at report time.
+    pub(crate) const COUNT: usize = 3;
+
+    const ALL: [PreflightPart; Self::COUNT] = [
+        PreflightPart::Refs,
+        PreflightPart::Air,
+        PreflightPart::Cache,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            PreflightPart::Refs => 0,
+            PreflightPart::Air => 1,
+            PreflightPart::Cache => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            PreflightPart::Refs => "refs",
+            PreflightPart::Air => "air",
+            PreflightPart::Cache => "cache",
+        }
+    }
+}
+
+/// The per-opcode split of `proc_ns`, indexed by the opcode itself.
+///
+/// Sized from the contract rather than from a count of the arms
+/// `process_child_packet` happens to have: [`CHILD_OP_MAX`] is the largest
+/// opcode the child FIFO defines, so a table one wider than it can hold every
+/// opcode the guest can legally send and there is no bound left to overflow.
+/// That is the whole reason this is direct-indexed rather than an associative
+/// table with a probe and a dropped-entry counter — a capacity derived from the
+/// wire format cannot be one short the way a hand-picked slot count can.
+///
+/// An opcode above the maximum is counted in `above_max` rather than indexed;
+/// decode is expected to have refused it long before here, so a non-zero reading
+/// is a decoder result, not a table result.
+///
+/// Its own type because `#[derive(Default)]` stops at 32-element arrays and
+/// this is 65 wide. The manual impl is the whole cost of getting the bound from
+/// the contract.
+struct ProcOpTable {
+    ns: [std::sync::atomic::AtomicU64; PROC_OP_SLOTS],
+    count: [std::sync::atomic::AtomicU64; PROC_OP_SLOTS],
+    above_max: std::sync::atomic::AtomicU64,
+}
+
+/// One slot per legal child opcode, `0..=CHILD_OP_MAX`. Derived from the
+/// contract's own maximum, so a new opcode widens the table by widening that.
+const PROC_OP_SLOTS: usize = crate::model::CHILD_OP_MAX as usize + 1;
+
+impl Default for ProcOpTable {
+    fn default() -> Self {
+        Self {
+            ns: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            count: std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0)),
+            above_max: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+/// Which of the three accesses `drain_child_fifo` makes around a packet.
+///
+/// They were one counter first, and the aggregate misled: it read 5055 ns an
+/// access, which is not a plausible cost for four bytes and is only explicable
+/// if the three are not alike. They are not — see the `regs_op_ns` field doc.
+#[derive(Clone, Copy)]
+pub enum RegsOp {
+    /// The `CHILD_REG_TAIL` read at the top of each loop iteration. A four-byte
+    /// `address_space_read`, and the one op here that really is one.
+    TailRead,
+    /// The `CHILD_REG_HEAD` writeback after a packet is processed. Four bytes
+    /// again, but through `gpa_map::write_u32` rather than the raw callback, so
+    /// it carries whatever page bookkeeping that path does.
+    HeadWrite,
+    /// The completion stamp. **Not a word write**: on the Vulkan arm this tries
+    /// the GPU rail first — resolving a guest RAM reference and submitting a
+    /// command buffer — and falls through to a blocking settle when that
+    /// declines. If the 97 ms/s is anywhere, the prior is that it is here, which
+    /// is exactly why it is measured rather than assumed.
+    Stamp,
+}
+
+impl RegsOp {
+    /// How many accesses there are. The census arrays are sized from this, so a
+    /// new variant that forgets to bump it fails to build [`Self::ALL`] rather
+    /// than overflowing an array at report time.
+    pub(crate) const COUNT: usize = 3;
+
+    const ALL: [RegsOp; Self::COUNT] = [RegsOp::TailRead, RegsOp::HeadWrite, RegsOp::Stamp];
+
+    const fn index(self) -> usize {
+        match self {
+            RegsOp::TailRead => 0,
+            RegsOp::HeadWrite => 1,
+            RegsOp::Stamp => 2,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            RegsOp::TailRead => "tailrd",
+            RegsOp::HeadWrite => "headwr",
+            RegsOp::Stamp => "stamp",
         }
     }
 }
@@ -722,6 +1165,101 @@ pub(crate) struct DrainDutyCensus {
     computes: std::sync::atomic::AtomicU64,
     flush_us: std::sync::atomic::AtomicU64,
     flushes: std::sync::atomic::AtomicU64,
+    /// The two things a tranche does after `Device::drain` returns and before
+    /// `drain_us` is taken: submit the deferred draw batch, and publish the
+    /// present boundary.
+    ///
+    /// They are inside `drain_us` and outside every `DrainPhase`, which is the
+    /// gap this pair closes. On a driven `blur=40` boot `drain_us` was 933 ms a
+    /// second against `draw_us` 604 ms — **a third of the drain worker's wall
+    /// clock named by nothing**, on the one thread every guest packet is
+    /// serialized through. The same gap is 37 % on the sustained-animation
+    /// probe, so it is not a property of one workload.
+    tail_us: std::sync::atomic::AtomicU64,
+    boundary_us: std::sync::atomic::AtomicU64,
+    /// The per-packet halves of that same residue: the ring snapshot reads and
+    /// the decode. Both run for every packet either FIFO drains, both sit
+    /// inside `drain_us`, and neither is inside any [`DrainPhase`] — so if the
+    /// third of the drain worker named by nothing is per-packet rather than
+    /// per-opcode, it is here.
+    ///
+    /// **Nanoseconds, not microseconds, and that is not a style choice.** These
+    /// fire tens of thousands of times a second and a single one costs well
+    /// under a microsecond, so `as_micros()` would truncate most samples to
+    /// zero and report a rail that runs constantly as free. `tail_us` above can
+    /// afford microseconds because it is sampled once per tranche.
+    ring_ns: std::sync::atomic::AtomicU64,
+    ring_reads: std::sync::atomic::AtomicU64,
+    decode_ns: std::sync::atomic::AtomicU64,
+    packets: std::sync::atomic::AtomicU64,
+    /// The rest of `drain_child_fifo`, so that the loop is covered end to end
+    /// rather than sampled at two points.
+    ///
+    /// Two instruments in a row named a candidate from reading the code and
+    /// were worth 0.3 % between them, so this does not name a third: `proc_ns`
+    /// spans the whole opcode dispatch, `regs_ns` the guest register traffic
+    /// every packet pays around it, and `setup_ns` the per-call prologue. With
+    /// `ring_ns` and `decode_ns` those five tile one iteration of the loop, so
+    /// whatever is left after subtracting them from the residue is *outside*
+    /// the child FIFO entirely and the search moves rather than guesses again.
+    ///
+    /// `proc_ns` contains `draw_us` and `compute_us`, which name themselves on
+    /// the same line — subtract them and what remains is the dispatch's own
+    /// per-opcode cost. The other two contain nothing that names itself.
+    ///
+    /// Nanoseconds for the same reason as the pair above: `regs_ns` fires three
+    /// times a packet and each one is a handful of guest word accesses.
+    proc_ns: std::sync::atomic::AtomicU64,
+    regs_ns: std::sync::atomic::AtomicU64,
+    regs_ops: std::sync::atomic::AtomicU64,
+    setup_ns: std::sync::atomic::AtomicU64,
+    setup_calls: std::sync::atomic::AtomicU64,
+    /// `regs_ns` split by which of the three accesses it was, because the
+    /// aggregate turned out to be averaging three unlike things.
+    ///
+    /// The span was added expecting three cheap guest word accesses a packet and
+    /// measured **5055 ns each**, 25x what an `address_space_read` of four bytes
+    /// costs. `write_stamp` is why it cannot be read as register traffic: on the
+    /// Vulkan arm it tries `stamp_word_ordered_on_gpu` first, which resolves a
+    /// guest RAM reference and *submits a GPU command buffer*, and falls through
+    /// to a blocking settle when that declines. So one of the three is a
+    /// submission or a quiesce and the other two are word accesses, and a single
+    /// bucket cannot say which carries the 97 ms/s.
+    ///
+    /// Indexed by [`RegsOp::index`]. The three **must** sum to `regs_ns` and the
+    /// counts to `regs_ops`; that identity is the cheapest way to catch a
+    /// mis-attributed site, so both the total and the split are emitted.
+    regs_op_ns: [std::sync::atomic::AtomicU64; RegsOp::COUNT],
+    regs_op_count: [std::sync::atomic::AtomicU64; RegsOp::COUNT],
+    /// `proc_ns` split by the opcode that was dispatched, as an associative
+    /// table keyed by the guest opcode itself.
+    ///
+    /// `proc - draw - compute` is 155-165 ms/s over two driven boots — the
+    /// larger half of the residue, and 24 us a packet against a decode that
+    /// costs 117 ns. `process_child_packet` is a match over ~24 arms and only
+    /// one of them has ever been timed, so nothing says whether that 155 ms is
+    /// one arm or spread across all of them.
+    ///
+    /// Keyed by opcode rather than by a hand-written class enum because the
+    /// point is to find out which arms cost, and a class enum written now would
+    /// encode the guess this instrument exists to avoid. Slots are claimed on
+    /// first sight and never released, so the key scan is over the handful of
+    /// opcodes a boot actually issues.
+    ///
+    /// See [`ProcOpTable`] for why this is indexed by the opcode rather than
+    /// keyed by a class this device would have had to invent.
+    proc_ops: ProcOpTable,
+    /// The inside of `CHILD_OP_EXEC_INDIRECT2`, indexed by [`ExecPhase::index`].
+    /// Sums to that opcode's own `op0x37_us` on the `drain_ops` line.
+    exec_ns: [std::sync::atomic::AtomicU64; ExecPhase::COUNT],
+    exec_count: [std::sync::atomic::AtomicU64; ExecPhase::COUNT],
+    /// The inside of [`ExecPhase::Preflight`], indexed by
+    /// [`PreflightPart::index`]. Sums to `preflight_us` on the `exec_phase`
+    /// line. `pre_pipes` is the distinct pipeline refs the scan resolved, which
+    /// is the denominator every per-pipeline figure needs.
+    pre_ns: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
+    pre_count: [std::sync::atomic::AtomicU64; PreflightPart::COUNT],
+    pre_pipes: std::sync::atomic::AtomicU64,
     max_tranche_us: std::sync::atomic::AtomicU64,
     /// Longest single Flush in the window. `flush_us/flushes` is a mean, and a
     /// mean cannot tell "every flush costs 7.7 ms" from "most are free and one
@@ -885,6 +1423,156 @@ impl DrainDutyCensus {
         self.rb_max_us[i].fetch_max(us, Relaxed);
     }
 
+    /// Attribute the tranche tail — the deferred-batch submit and the present
+    /// boundary — which sit inside `drain_us` and inside no [`DrainPhase`].
+    pub(crate) fn note_tail(&self, tail_us: u64, boundary_us: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.tail_us.fetch_add(tail_us, Relaxed);
+        self.boundary_us.fetch_add(boundary_us, Relaxed);
+    }
+
+    /// One ring snapshot read, in nanoseconds. Twice per packet — the header,
+    /// then the packet the header sized.
+    pub(crate) fn note_ring(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.ring_ns.fetch_add(ns, Relaxed);
+        self.ring_reads.fetch_add(1, Relaxed);
+    }
+
+    /// One packet decode, in nanoseconds. The count is the packet count for
+    /// both FIFOs, which is what every per-packet figure is normalized by.
+    pub(crate) fn note_decode(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.decode_ns.fetch_add(ns, Relaxed);
+        self.packets.fetch_add(1, Relaxed);
+    }
+
+    /// One `process_child_packet` dispatch, in nanoseconds, into the total and
+    /// into the slot for its opcode. Contains the draw and compute phases, which
+    /// name themselves on the same line.
+    pub(crate) fn note_proc(&self, opcode: u16, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.proc_ns.fetch_add(ns, Relaxed);
+        let Some(slot) = self.proc_ops.ns.get(opcode as usize) else {
+            self.proc_ops.above_max.fetch_add(1, Relaxed);
+            return;
+        };
+        slot.fetch_add(ns, Relaxed);
+        self.proc_ops.count[opcode as usize].fetch_add(1, Relaxed);
+    }
+
+    /// The per-opcode split of the window [`Self::note`] just reported, or
+    /// `None` when no packet was dispatched in it.
+    ///
+    /// Sits under `drain_duty`'s `proc_us` and divides it: the `_us` fields sum
+    /// to `proc_us` and the `_n` fields to `packets`. Only opcodes the window
+    /// actually saw are printed, so a line names the arms this workload takes
+    /// rather than all 65 the contract allows.
+    pub(crate) fn take_proc_ops(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for opcode in 0..PROC_OP_SLOTS {
+            let n = self.proc_ops.count[opcode].swap(0, Relaxed);
+            let us = self.proc_ops.ns[opcode].swap(0, Relaxed) / 1000;
+            if n == 0 {
+                continue;
+            }
+            any = true;
+            body.push_str(&format!(" op{opcode:#04x}_us={us} op{opcode:#04x}_n={n}"));
+        }
+        let above = self.proc_ops.above_max.swap(0, Relaxed);
+        any.then(|| format!("drain_ops win_ms={win_ms} above_max={above}{body}"))
+    }
+
+    /// One span inside the translation preflight, in nanoseconds.
+    pub(crate) fn note_preflight(&self, part: PreflightPart, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = part.index();
+        self.pre_ns[i].fetch_add(ns, Relaxed);
+        self.pre_count[i].fetch_add(1, Relaxed);
+    }
+
+    /// One distinct pipeline ref the preflight scan resolved.
+    pub(crate) fn note_preflight_pipe(&self) {
+        self.pre_pipes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The inside of the preflight over the window [`Self::note`] just reported.
+    ///
+    /// Read against `exec_phase`: these three sum to its `preflight_us`.
+    /// `pipes` is the distinct pipeline refs resolved, so `air_us / pipes` is
+    /// what one AIR resolve costs and `pipes / preflight_n` is how many the
+    /// average packet re-derives.
+    pub(crate) fn take_preflight_parts(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for part in PreflightPart::ALL {
+            let i = part.index();
+            let us = self.pre_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.pre_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = part.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        let pipes = self.pre_pipes.swap(0, Relaxed);
+        any.then(|| format!("preflight_split win_ms={win_ms} pipes={pipes}{body}"))
+    }
+
+    /// One span inside `process_exec_indirect2`, in nanoseconds.
+    pub(crate) fn note_exec(&self, phase: ExecPhase, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let i = phase.index();
+        self.exec_ns[i].fetch_add(ns, Relaxed);
+        self.exec_count[i].fetch_add(1, Relaxed);
+    }
+
+    /// The inside of `CHILD_OP_EXEC_INDIRECT2` over the window [`Self::note`]
+    /// just reported, or `None` when no exec packet ran in it.
+    ///
+    /// Read against `drain_ops`: these five sum to its `op0x37_us`. `finish_us`
+    /// contains `drain_duty`'s `draw_us`, so `finish_us - draw_us` is the
+    /// per-draw setup and result handling that sits around the encode and is
+    /// named by nothing else.
+    pub(crate) fn take_exec_phases(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let win_ms = self.last_win_ms.load(Relaxed);
+        let mut body = String::new();
+        let mut any = false;
+        for phase in ExecPhase::ALL {
+            let i = phase.index();
+            let us = self.exec_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.exec_count[i].swap(0, Relaxed);
+            any |= n != 0;
+            let label = phase.label();
+            body.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
+        any.then(|| format!("exec_phase win_ms={win_ms}{body}"))
+    }
+
+    /// One access around a packet, in nanoseconds, into both the total and the
+    /// per-op split. Recording both is what makes the sum identity checkable.
+    pub(crate) fn note_regs(&self, op: RegsOp, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.regs_ns.fetch_add(ns, Relaxed);
+        self.regs_ops.fetch_add(1, Relaxed);
+        let i = op.index();
+        self.regs_op_ns[i].fetch_add(ns, Relaxed);
+        self.regs_op_count[i].fetch_add(1, Relaxed);
+    }
+
+    /// One `drain_child_fifo` prologue, in nanoseconds: the three register
+    /// reads, the ring resolve, and the page-GPA copy the loop reads from.
+    pub(crate) fn note_setup(&self, ns: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.setup_ns.fetch_add(ns, Relaxed);
+        self.setup_calls.fetch_add(1, Relaxed);
+    }
+
     /// Accumulate one completed tranche and return the line when a report is
     /// due. Returns the line rather than emitting it so the reporting rule is
     /// testable without a log sink: that the window resets on report (so the
@@ -925,6 +1613,29 @@ impl DrainDutyCensus {
         let flush = self.flush_us.swap(0, Relaxed);
         let flushes = self.flushes.swap(0, Relaxed);
         let max_flush = self.max_flush_us.swap(0, Relaxed);
+        let tail = self.tail_us.swap(0, Relaxed);
+        let boundary = self.boundary_us.swap(0, Relaxed);
+        // Reported in microseconds like every other span on this line, but
+        // accumulated in nanoseconds — see the field docs.
+        let ring = self.ring_ns.swap(0, Relaxed) / 1000;
+        let ring_reads = self.ring_reads.swap(0, Relaxed);
+        let decode = self.decode_ns.swap(0, Relaxed) / 1000;
+        let packets = self.packets.swap(0, Relaxed);
+        let proc_us = self.proc_ns.swap(0, Relaxed) / 1000;
+        let regs = self.regs_ns.swap(0, Relaxed) / 1000;
+        let regs_ops = self.regs_ops.swap(0, Relaxed);
+        let setup = self.setup_ns.swap(0, Relaxed) / 1000;
+        let setup_calls = self.setup_calls.swap(0, Relaxed);
+        // Emitted beside the total it divides, so `tailrd_us + headwr_us +
+        // stamp_us == regs_us` is checkable on the line itself.
+        let mut regs_split = String::new();
+        for op in RegsOp::ALL {
+            let i = op.index();
+            let us = self.regs_op_ns[i].swap(0, Relaxed) / 1000;
+            let n = self.regs_op_count[i].swap(0, Relaxed);
+            let label = op.label();
+            regs_split.push_str(&format!(" {label}_us={us} {label}_n={n}"));
+        }
         let slow = self.slow_tranches.swap(0, Relaxed);
         let busy = drain.saturating_add(publish);
         let duty = busy as f64 / (win_ms as f64 * 1000.0);
@@ -933,6 +1644,10 @@ impl DrainDutyCensus {
              duty={duty:.3} drain_us={drain} publish_us={publish} max_tranche_us={max} \
              draw_us={draw} draws={draws} compute_us={compute} computes={computes} \
              flush_us={flush} flushes={flushes} max_flush_us={max_flush} \
+             tail_us={tail} boundary_us={boundary} \
+             ring_us={ring} ring_reads={ring_reads} decode_us={decode} packets={packets} \
+             proc_us={proc_us} regs_us={regs} regs_ops={regs_ops}{regs_split} \
+             setup_us={setup} setup_calls={setup_calls} \
              slow_tranches={slow}/{tranches} slow_us={DRAIN_TRANCHE_SLOW_US}"
         ))
     }
@@ -1358,6 +2073,109 @@ pub fn note_resident_window_flushed() {
     RESIDENT_ARM.note_flush(crate::observe::elapsed_us());
 }
 
+/// When the drain tranche now running started, in [`crate::observe::elapsed_us`].
+///
+/// One word, written once per tranche by the worker that owns it. A device runs
+/// one drain worker, so there is no interleaving to lose; a second device would
+/// share this and the two would blend, which is why nothing here claims to be
+/// per device.
+static TRANCHE_START_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Mark the start of a drain tranche, for [`tranche_elapsed_us`].
+pub fn note_tranche_started(now_us: u64) {
+    TRANCHE_START_US.store(now_us, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How long the tranche now running has been running.
+///
+/// The question this exists for: a guest clears an object-list slot by writing
+/// its own memory, which nothing orders against the ring except how fast this
+/// device reads it — so a lookup that finds a cleared slot should be one that
+/// happened *late* in a long tranche. Reading zero before the first tranche is
+/// harmless; nothing consults it outside one.
+pub fn tranche_elapsed_us() -> u64 {
+    crate::observe::elapsed_us()
+        .saturating_sub(TRANCHE_START_US.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Band one object-list lookup by how late in its tranche it happened.
+///
+/// Bands rather than a mean, because the claim being tested is about a **tail**:
+/// "the losing lookups sit behind the long tranches" is false if they are spread
+/// like every other lookup, and two means that differ by a little cannot tell
+/// those apart.
+///
+/// `hit` picks the family, and the hit family is the point. A miss banding that
+/// skewed late would prove nothing on its own if *every* lookup skews late — the
+/// control is the whole reason this is worth recording, and the session that
+/// added it had already been caught once reading an instrument without one.
+pub fn note_list_lookup_age(hit: bool, us: u64) {
+    note_store_route(list_lookup_age_route(hit, us));
+}
+
+/// The counter name for one banded lookup, total over both families and every
+/// age.
+fn list_lookup_age_route(hit: bool, us: u64) -> &'static str {
+    match (hit, us) {
+        (true, 0..=99) => "list_hit_age_under_100us",
+        (true, 100..=999) => "list_hit_age_under_1ms",
+        (true, 1_000..=9_999) => "list_hit_age_under_10ms",
+        (true, 10_000..=99_999) => "list_hit_age_under_100ms",
+        (true, _) => "list_hit_age_over_100ms",
+        (false, 0..=99) => "list_miss_age_under_100us",
+        (false, 100..=999) => "list_miss_age_under_1ms",
+        (false, 1_000..=9_999) => "list_miss_age_under_10ms",
+        (false, 10_000..=99_999) => "list_miss_age_under_100ms",
+        (false, _) => "list_miss_age_over_100ms",
+    }
+}
+
+/// Attribute the tranche tail: the deferred-batch submit and the present
+/// boundary, both inside `drain_us` and inside no [`DrainPhase`].
+pub fn note_drain_tail(tail_us: u64, boundary_us: u64) {
+    DRAIN_DUTY.note_tail(tail_us, boundary_us);
+}
+
+/// Attribute one ring snapshot read, in nanoseconds.
+pub fn note_drain_ring(ns: u64) {
+    DRAIN_DUTY.note_ring(ns);
+}
+
+/// Attribute one packet decode, in nanoseconds.
+pub fn note_drain_decode(ns: u64) {
+    DRAIN_DUTY.note_decode(ns);
+}
+
+/// Attribute one `process_child_packet` dispatch, in nanoseconds, by opcode.
+pub fn note_drain_proc(opcode: u16, ns: u64) {
+    DRAIN_DUTY.note_proc(opcode, ns);
+}
+
+/// Attribute one span inside `process_exec_indirect2`, in nanoseconds.
+pub fn note_exec_phase(phase: ExecPhase, ns: u64) {
+    DRAIN_DUTY.note_exec(phase, ns);
+}
+
+/// Attribute one span inside the translation preflight, in nanoseconds.
+pub fn note_preflight_part(part: PreflightPart, ns: u64) {
+    DRAIN_DUTY.note_preflight(part, ns);
+}
+
+/// Count one distinct pipeline ref the preflight scan resolved.
+pub fn note_preflight_pipe() {
+    DRAIN_DUTY.note_preflight_pipe();
+}
+
+/// Attribute one access around a packet, in nanoseconds, by which one it was.
+pub fn note_drain_regs(op: RegsOp, ns: u64) {
+    DRAIN_DUTY.note_regs(op, ns);
+}
+
+/// Attribute one `drain_child_fifo` prologue, in nanoseconds.
+pub fn note_drain_setup(ns: u64) {
+    DRAIN_DUTY.note_setup(ns);
+}
+
 /// Accumulate one completed drain tranche; emits at most once per second.
 pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
     if let Some(line) = DRAIN_DUTY.note(drain_us, publish_us, crate::observe::elapsed_ms() as u64) {
@@ -1366,6 +2184,21 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         // rails must sum to its `flush_us` and their counts to its `flushes`.
         if let Some(rails) = DRAIN_DUTY.take_flush_rails() {
             crate::observe::off(rails);
+        }
+        // Also immediately after `drain_duty`, and read the same way: the
+        // per-opcode `_us` fields sum to its `proc_us` and the `_n` fields to
+        // its `packets`, less `op_overflow`.
+        if let Some(ops) = DRAIN_DUTY.take_proc_ops() {
+            crate::observe::off(ops);
+        }
+        // Under `drain_ops`, dividing its `op0x37_us` the way `chain_phase`
+        // divides `draw_us`.
+        if let Some(exec) = DRAIN_DUTY.take_exec_phases() {
+            crate::observe::off(exec);
+        }
+        // Under `exec_phase`, dividing its `preflight_us`.
+        if let Some(pre) = DRAIN_DUTY.take_preflight_parts() {
+            crate::observe::off(pre);
         }
         // Under `flush_rails`, dividing its `render_us`.
         if let Some(split) = DRAIN_DUTY.take_readback_split() {
@@ -1399,16 +2232,43 @@ pub fn note_drain_tranche(drain_us: u64, publish_us: u64) {
         if let Some(outstanding) = crate::runtime::objects::type4_backing_outstanding_census() {
             crate::observe::off(outstanding);
         }
+        // The same reason and the same place: `store_routes` counts the watches
+        // that *ended*, and a slot still waiting is skipped by every sweep it
+        // survives, so without this line the misses and the verdicts do not
+        // reconcile and the difference reads as lost records.
+        if let Some(watching) = crate::runtime::objects::slot_recheck::outstanding_census() {
+            crate::observe::off(watching);
+        }
         // Onto the census cadence rather than a timer of its own, so a reader
         // pairing the footprint against `store_routes` is reading one clock.
         // The run dump rate-limits itself; this is the only caller.
         for line in crate::observe::footprint::census_lines(crate::observe::elapsed_ms() as u64) {
             crate::observe::off(line);
         }
+        // Beside the engine counters it has to be read against: the eviction
+        // routes say which cap fired and this says how much the workload wanted,
+        // and neither is interpretable without the other.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(wanted) = crate::backend::vulkan::engine::sampled_working_set_census() {
+            crate::observe::off(wanted);
+        }
+        // The same question one rail over, and the one with no cache behind it
+        // yet: `buffer_guest_gathers` says how many gathers ran and this says
+        // how few distinct windows they were.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(wanted) = crate::backend::vulkan::engine::buffer_gather_working_set_census() {
+            crate::observe::off(wanted);
+        }
+        // Beside it, because the two answer one question between them: that one
+        // says the same window comes back and this says whether its bytes moved.
+        #[cfg(feature = "backend-vulkan")]
+        if let Some(fresh) = crate::runtime::buffer_gather_freshness::census() {
+            crate::observe::off(fresh);
+        }
         emit_engine_delta();
         // After `emit_engine_delta`, which emits `draw_phase`: the two divide
         // against each other and reading them in the other order invites
-        // treating the engine's twelve phases as the whole draw, which is the
+        // treating the engine's phases as the whole draw, which is the
         // misreading this line exists to correct. Not gated on the backend —
         // the timer is runtime-side and the Metal arm can adopt it without a
         // second census.
@@ -1542,7 +2402,8 @@ fn emit_engine_delta() {
         "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
          batch_flush_draws={} batch_readback_joins={} readbacks={} readback_bytes={} render_post_wait_skips={} \
          target_reads={} target_read_bytes={} gpu_stamps={} pipeline_misses={} \
-         shader_misses={} pass_misses={} layout_misses={} sampler_misses={} \
+         shader_misses={} shader_hits={} shader_digest_hits={} shader_hash_words={} \
+         pass_misses={} layout_misses={} sampler_misses={} \
          sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
          sampled_cache_misses={} sampled_reuploads={} \
          sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
@@ -1554,9 +2415,11 @@ fn emit_engine_delta() {
          buffer_guest_imports={} buffer_guest_import_bytes={} \
          buffer_guest_gathers={} buffer_guest_gather_bytes={} \
          buffer_guest_gather_regions={} \
+         buffer_gather_dispatches={} buffer_gather_declined={} \
          buffer_bind_reuses={} \
          buffer_snapshot_binds={} \
          guest_write_linear={} guest_write_rects={} guest_write_regions={} \
+         guest_write_dispatches={} guest_write_scatter_declined={} \
          seed_uploads={} seed_upload_bytes={} \
          ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
         d.creates,
@@ -1574,6 +2437,9 @@ fn emit_engine_delta() {
         d.gpu_stamps,
         d.pipeline_misses,
         d.shader_misses,
+        d.shader_hits,
+        d.shader_digest_hits,
+        d.shader_hash_words,
         d.pass_misses,
         d.layout_misses,
         d.sampler_misses,
@@ -1599,11 +2465,15 @@ fn emit_engine_delta() {
         d.buffer_guest_gathers,
         d.buffer_guest_gather_bytes,
         d.buffer_guest_gather_regions,
+        d.buffer_gather_dispatches,
+        d.buffer_gather_declined,
         d.buffer_bind_reuses,
         d.buffer_snapshot_binds,
         d.guest_write_linear,
         d.guest_write_rects,
         d.guest_write_regions,
+        d.guest_write_dispatches,
+        d.guest_write_scatter_declined,
         d.seed_uploads,
         d.seed_upload_bytes,
         d.ring_retire_blocks,
@@ -1691,7 +2561,7 @@ fn emit_registry_pressure(now: &crate::backend::vulkan::engine::CounterSnapshot)
 ///
 /// `draw_phase` divides the engine and `chain_phase` divides everything around
 /// it, so this line is emitted immediately after that one and the two are read
-/// together: `chain_phase`'s `engine_us` must equal `draw_phase`'s twelve
+/// together: `chain_phase`'s `engine_us` must equal `draw_phase`'s phases
 /// summed, and `chain_phase`'s eight must equal `drain_duty`'s `draw_us`.
 /// Whatever `draw_phase` does not account for is the other seven bars here, and
 /// on the boot that motivated this line that was 82% of the draw.
@@ -1709,8 +2579,23 @@ fn emit_bind_phase() {
         return;
     };
     crate::observe::off(format!(
-        "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={}",
-        w.binds, w.vertex_us, w.fragment_us, w.attrs_us,
+        "bind_phase binds={} vertex_us={} fragment_us={} attrs_us={} \
+         acc_unused={} acc_deref={} acc_undecl={} acc_n={} acc_unused_staged={} neutral={}",
+        w.binds,
+        w.vertex_us,
+        w.fragment_us,
+        w.attrs_us,
+        w.access_unused,
+        w.access_dereferenced,
+        w.access_undeclared,
+        // The three classes partition the buffer binds resolved in the window,
+        // so this is their sum and not a separately-counted total: a reader who
+        // divides gets an identity that holds or a bug that shows.
+        w.access_total(),
+        // These two partition `acc_unused` in turn, so the second identity on
+        // the line is `acc_unused_staged + neutral == acc_unused`.
+        w.access_unused_staged,
+        w.neutral_served,
     ));
 }
 
@@ -1719,17 +2604,26 @@ fn emit_chain_phase() {
         return;
     };
     crate::observe::off(format!(
-        "chain_phase chains={} prep_us={} pipeline_us={} binds_us={} sampled_us={} \
-         seed_us={} assemble_us={} engine_us={} store_us={} max_us={}",
+        "chain_phase chains={} prep_us={} pipeline_us={} pl_gen_us={} pl_desc_us={} \
+         pl_mtlb_us={} pl_air_us={} pl_xlate_us={} binds_us={} sampled_us={} \
+         seed_us={} assemble_us={} engine_us={} store_us={} prep_seed_us={} \
+         prep_pages_us={} max_us={}",
         w.chains,
         w.prep_us,
         w.pipeline_us,
+        w.pipeline_gen_us,
+        w.pipeline_desc_us,
+        w.pipeline_mtlb_us,
+        w.pipeline_air_us,
+        w.pipeline_xlate_us,
         w.binds_us,
         w.sampled_us,
         w.seed_us,
         w.assemble_us,
         w.engine_us,
         w.store_us,
+        w.prep_seed_us,
+        w.prep_pages_us,
         w.max_us,
     ));
     // Under `chain_phase`, dividing its largest column the same way
@@ -1771,7 +2665,9 @@ fn emit_draw_phase() {
         return;
     };
     crate::observe::off(format!(
-        "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} stage_us={} stage_pass_us={} \
+        "draw_phase draws={} prep_us={} slot_us={} pipeline_us={} \
+         pl_depth_us={} pl_shader_us={} pl_layoutpass_us={} pl_compile_us={} pl_sampler_us={} \
+         stage_us={} stage_pass_us={} \
          acquire_us={} acquire_sampled_us={} sampled_upload_us={} acquire_readback_us={} \
          descriptors_us={} \
          record_us={} submit_us={} wait_us={} readback_us={} max_us={} stalls={}",
@@ -1779,6 +2675,11 @@ fn emit_draw_phase() {
         w.prep_us,
         w.slot_us,
         w.pipeline_us,
+        w.pipeline_depth_us,
+        w.pipeline_shader_us,
+        w.pipeline_layout_pass_us,
+        w.pipeline_compile_us,
+        w.pipeline_sampler_us,
         w.stage_us,
         w.stage_pass_us,
         w.acquire_us,
@@ -1794,6 +2695,80 @@ fn emit_draw_phase() {
         w.stalls,
     ));
     emit_stage_phase();
+    emit_gather_phase();
+    emit_gpu_span();
+}
+
+/// Beside `draw_phase`, because it is the one column in it the GPU wrote.
+///
+/// `slot_us` above is the drain worker blocked on a ring fence, and every session
+/// before this one read that as "the GPU is busy" without a GPU-side number
+/// existing. `busy_us` is that number: GPU microseconds summed over the
+/// submissions retired this window, from timestamps each command buffer wrote
+/// into itself.
+///
+/// Read the pair and never `busy_us` alone. Against a census second it is
+/// utilisation; against `slot_us` it is how much of the worker's wait was this
+/// device's own recorded work rather than queue latency, and those are two
+/// different questions with two different fixes. `armed`/`sealed`/`read` say
+/// whether a low reading is a quiet GPU or a probe that did not close.
+///
+/// The five `*_us`/`*_n` pairs tile `busy_us`/`read` by what the submission was
+/// recorded for, so the shares say which rail owns the device's GPU time without
+/// an ablation. `unattributed` is the identity that keeps that honest: it is
+/// `read` minus the per-kind counts and must be zero.
+///
+/// **A per-second `busy_us` is not comparable across boots that delivered
+/// different amounts of work.** The guest sets the draw rate on this rail, so a
+/// change that slows the guest lowers `busy_us` by lowering the workload. Divide
+/// by `draw_phase draws` or by the kind's own `*_n` before comparing two arms —
+/// the writeback's own positive control halved the frame rate and lowered
+/// `busy_us` by 48 % while per-submission GPU cost moved 1.5 %.
+#[cfg(feature = "backend-vulkan")]
+fn emit_gpu_span() {
+    let Some(w) = crate::backend::vulkan::engine::gpu_span::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "gpu_span busy_us={} busy_max_us={} read={} armed={} sealed={} unread={} \
+         unattributed={} draw_us={} draw_n={} store_us={} store_n={} \
+         readback_us={} readback_n={} compute_us={} compute_n={} stamp_us={} stamp_n={}",
+        w.busy_us,
+        w.busy_max_us,
+        w.read,
+        w.armed,
+        w.sealed,
+        w.unread,
+        w.unattributed(),
+        w.kind_us[0],
+        w.kind_n[0],
+        w.kind_us[1],
+        w.kind_n[1],
+        w.kind_us[2],
+        w.kind_n[2],
+        w.kind_us[3],
+        w.kind_n[3],
+        w.kind_us[4],
+        w.kind_n[4],
+    ));
+}
+
+/// Where a compute-gather dispatch's CPU cost goes, four ways.
+///
+/// Emitted only when a gather dispatched, so the line's presence is itself the
+/// statement that this boot ran the dispatch arm — see
+/// [`crate::backend::vulkan::engine::gather_phase`] for what each part is and
+/// what would remove it.
+#[cfg(feature = "backend-vulkan")]
+fn emit_gather_phase() {
+    let Some(w) = crate::backend::vulkan::engine::gather_phase::take_window() else {
+        return;
+    };
+    crate::observe::off(format!(
+        "gather_phase plan_us={} plan_n={} stage_us={} stage_n={} \
+         dset_us={} dset_n={} record_us={} record_n={}",
+        w.plan_us, w.plan_n, w.stage_us, w.stage_n, w.dset_us, w.dset_n, w.record_us, w.record_n,
+    ));
 }
 
 /// Under `draw_phase`, dividing its largest column — `stage_us` is 83 % of that
@@ -2063,4 +3038,53 @@ fn take_store_routes() -> Option<String> {
     }
     routes.clear();
     Some(out)
+}
+
+#[cfg(test)]
+mod lookup_age_tests {
+    use super::list_lookup_age_route;
+
+    /// Every decade boundary lands in the band below it, and the two families
+    /// never share a counter.
+    ///
+    /// The boundaries are the whole content of this function, and an off-by-one
+    /// at one of them would move a population between decades without any
+    /// reading looking wrong — which is exactly the shape of error a banding is
+    /// built to avoid making.
+    #[test]
+    fn the_bands_are_decades_and_the_two_families_are_disjoint() {
+        const EDGES: [(u64, &str, &str); 6] = [
+            (0, "list_hit_age_under_100us", "list_miss_age_under_100us"),
+            (99, "list_hit_age_under_100us", "list_miss_age_under_100us"),
+            (100, "list_hit_age_under_1ms", "list_miss_age_under_1ms"),
+            (999, "list_hit_age_under_1ms", "list_miss_age_under_1ms"),
+            (1_000, "list_hit_age_under_10ms", "list_miss_age_under_10ms"),
+            (
+                10_000,
+                "list_hit_age_under_100ms",
+                "list_miss_age_under_100ms",
+            ),
+        ];
+        for (us, hit, miss) in EDGES {
+            assert_eq!(list_lookup_age_route(true, us), hit, "hit at {us}");
+            assert_eq!(list_lookup_age_route(false, us), miss, "miss at {us}");
+        }
+        for us in [100_000u64, 264_000, u64::MAX] {
+            assert_eq!(list_lookup_age_route(true, us), "list_hit_age_over_100ms");
+            assert_eq!(list_lookup_age_route(false, us), "list_miss_age_over_100ms");
+        }
+    }
+
+    /// No age reaches the same counter from both families, so a hit can never be
+    /// summed into the miss banding it is the control for.
+    #[test]
+    fn a_hit_and_a_miss_never_share_a_counter() {
+        for us in [0u64, 50, 100, 500, 1_000, 5_000, 10_000, 99_999, 100_000] {
+            assert_ne!(
+                list_lookup_age_route(true, us),
+                list_lookup_age_route(false, us),
+                "at {us}"
+            );
+        }
+    }
 }
