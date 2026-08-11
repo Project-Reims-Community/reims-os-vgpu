@@ -30,6 +30,56 @@ const SUBOPTIMAL_ALARM_STREAK: u32 = 60;
 /// The pre-content / letterbox-bar clear color (linear BGRA channels).
 const SLATE_CLEAR: [f32; 4] = [0.05, 0.06, 0.08, 1.0];
 
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+
+/// One frame at the refresh rate exposed to the guest bounds an acquire retry.
+///
+/// A zero-timeout probe stays first so the common path never sleeps with the
+/// shared engine lock held. If all images are busy, the bounded retry gives a
+/// WSI implementation a chance to process presentation-engine image releases.
+/// This is an engine-lock budget derived from the guest display contract; it
+/// makes no claim about the host presentation interval.
+const fn guest_frame_budget_ns(refresh_hz: u32) -> Option<u64> {
+    if refresh_hz == 0 {
+        None
+    } else {
+        Some(NANOS_PER_SECOND / refresh_hz as u64)
+    }
+}
+
+const ACQUIRE_RETRY_BUDGET_NS: u64 =
+    match guest_frame_budget_ns(crate::model::DISPLAY_REFRESH_HZ) {
+        Some(timeout) => timeout,
+        None => 0,
+    };
+const _: () = assert!(ACQUIRE_RETRY_BUDGET_NS > 0);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct AcquireRetry {
+    attempted: bool,
+    rescued: bool,
+}
+
+/// Probe without waiting, then enter WSI's bounded wait/dispatch path only when
+/// every image is currently busy. Keeping the policy here makes the accepted
+/// retry results and the one-retry bound independently testable.
+fn acquire_with_bounded_retry<T>(
+    mut acquire: impl FnMut(u64) -> Result<T, vk::Result>,
+) -> (Result<T, vk::Result>, AcquireRetry) {
+    let first = acquire(0);
+    match first {
+        Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
+            let retried = acquire(ACQUIRE_RETRY_BUDGET_NS);
+            let retry = AcquireRetry {
+                attempted: true,
+                rescued: retried.is_ok(),
+            };
+            (retried, retry)
+        }
+        result => (result, AcquireRetry::default()),
+    }
+}
+
 /// A host-window present degradation that does not abort the whole present.
 ///
 /// This is not a [`SlateReason`]: a persistent suboptimal flag still queues
@@ -439,6 +489,31 @@ pub(crate) fn swapchain_image_count(caps_min: u32, caps_max: u32, mode: vk::Pres
     count
 }
 
+/// Presentation-wait resources indexed by the image returned from acquire.
+///
+/// A submit fence only retires the rendering submission. It does not prove that
+/// the presentation engine has finished waiting on that submission's semaphore,
+/// so one semaphore reused for every frame can be signalled again while a prior
+/// present still owns it. Reacquiring image N is the portable proof that the
+/// prior present of image N has completed, which makes N the safe reuse key.
+struct PerSwapchainImage<T> {
+    slots: Vec<T>,
+}
+
+impl<T> PerSwapchainImage<T> {
+    fn new(slots: Vec<T>) -> Self {
+        Self { slots }
+    }
+
+    fn for_acquired(&self, image_index: u32) -> &T {
+        &self.slots[image_index as usize]
+    }
+
+    fn drain(&mut self) -> std::vec::Drain<'_, T> {
+        self.slots.drain(..)
+    }
+}
+
 pub(crate) struct WindowPresenter {
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -475,7 +550,7 @@ pub(crate) struct WindowPresenter {
     cmd_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
+    render_finished: PerSwapchainImage<vk::Semaphore>,
     in_flight: vk::Fence,
     submitted: bool,
     pinned: Vec<TargetIdentity>,
@@ -499,6 +574,11 @@ pub(crate) struct WindowPresenter {
     /// They have opposite fixes, and one `busy` count cannot tell them apart.
     cadence_busy_fence: u64,
     cadence_busy_acquire: u64,
+    /// Zero-timeout acquires that invoked the bounded retry, and the subset for
+    /// which that retry returned an image. An attempt may complete immediately;
+    /// this is not a measurement of time spent asleep.
+    cadence_acquire_retried: u64,
+    cadence_acquire_rescued: u64,
 }
 
 impl WindowPresenter {
@@ -577,28 +657,12 @@ impl WindowPresenter {
                 )));
             }
         };
-        let render_finished = match ctx
-            .device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                ctx.device.destroy_semaphore(image_available, None);
-                ctx.device.destroy_command_pool(cmd_pool, None);
-                surface_loader.destroy_surface(surface, None);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::WindowCreateRenderSemaphore,
-                    error,
-                )));
-            }
-        };
         let in_flight = match ctx.device.create_fence(
             &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
             None,
         ) {
             Ok(fence) => fence,
             Err(error) => {
-                ctx.device.destroy_semaphore(render_finished, None);
                 ctx.device.destroy_semaphore(image_available, None);
                 ctx.device.destroy_command_pool(cmd_pool, None);
                 surface_loader.destroy_surface(surface, None);
@@ -630,7 +694,7 @@ impl WindowPresenter {
             cmd_pool,
             cmd,
             image_available,
-            render_finished,
+            render_finished: PerSwapchainImage::new(Vec::new()),
             in_flight,
             submitted: false,
             pinned: Vec::new(),
@@ -642,6 +706,8 @@ impl WindowPresenter {
             cadence_last_offered: None,
             cadence_busy_fence: 0,
             cadence_busy_acquire: 0,
+            cadence_acquire_retried: 0,
+            cadence_acquire_rescued: 0,
         };
         if let Err(error) = presenter.recreate_swapchain(ctx) {
             presenter.destroy(ctx, None);
@@ -731,23 +797,17 @@ impl WindowPresenter {
         };
         // MAILBOX where the surface offers it, FIFO where it does not.
         //
-        // This rail acquires with a **zero timeout** and treats NOT_READY as a
-        // dropped frame, because the caller is the drain worker and blocking it
-        // on a vblank would stall guest command processing. Under FIFO an image
-        // only becomes acquirable when the presentation engine releases one at
-        // a refresh boundary, so a non-blocking acquire fails whenever the
-        // queue is full — and the frame is thrown away rather than deferred.
-        //
-        // Measured on a driven x86 boot: `host_window_cadence` reads
-        // `offered=51 presents=20 busy_acquire=330` per second, pinned at
-        // exactly 20.0 Hz. Three fifths of the frames the guest produced never
-        // reached the screen, and the window showed content up to 50 ms stale.
+        // Acquisition probes with a zero timeout first, because the window
+        // thread holds the shared engine lock here. An exhausted swapchain then
+        // gets one guest frame budget to let WSI process image releases; it
+        // never waits indefinitely behind the presentation engine or vblank.
         //
         // MAILBOX is the mode whose contract matches this consumer: the
-        // presentation engine keeps one pending image and *replaces* it, so an
-        // image is essentially always acquirable and the newest frame is the one
-        // displayed. A producer faster than the display stops losing frames and
-        // starts superseding them, which is what the caller already assumes.
+        // presentation engine keeps one pending image and *replaces* it, so the
+        // newest submitted frame is the one eventually displayed. The WSI may
+        // still need the bounded acquire above to process image releases;
+        // MAILBOX changes which queued frame survives, not whether the client
+        // must dispatch those releases.
         //
         // Capability-gated with no vendor or driver test, and FIFO remains the
         // fallback because it is the only mode Vulkan guarantees. MAILBOX also
@@ -782,8 +842,11 @@ impl WindowPresenter {
         // later present then succeeds (flagged suboptimal only) while the
         // window displays a single stretched pixel. Destroy-first makes the new
         // swapchain's layer configuration the final write, the ordering that
-        // workaround assumes. The queue idled above, so no submitted work
-        // references the old swapchain.
+        // workaround assumes. The queue idle above retires rendering submissions;
+        // unextended `vkQueuePresentKHR` has no completion fence, so final
+        // presentation-resource teardown here retains Vulkan's conventional
+        // wait-idle limitation. `VK_EXT_swapchain_maintenance1` would be needed
+        // for a strict host-visible completion proof.
         let from = self.extent;
         if self.swapchain != vk::SwapchainKHR::null() {
             self.swapchain_loader
@@ -820,7 +883,7 @@ impl WindowPresenter {
         // Fresh per-recreation semaphores: an acquire whose submit later failed
         // leaves `image_available` with a signal nobody consumed, which is
         // invalid to reuse on the new swapchain's first acquire. Created before
-        // the old pair is destroyed so a failure leaves the presenter
+        // the old set is destroyed so a failure leaves the presenter
         // consistent.
         let image_available = match ctx
             .device
@@ -835,24 +898,32 @@ impl WindowPresenter {
                 )));
             }
         };
-        let render_finished = match ctx
-            .device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-        {
-            Ok(semaphore) => semaphore,
-            Err(error) => {
-                ctx.device.destroy_semaphore(image_available, None);
-                self.swapchain_loader.destroy_swapchain(swapchain, None);
-                return Err(DrawError::VkCall(VkCall::new(
-                    VkOp::WindowCreateRenderSemaphore,
-                    error,
-                )));
+        let mut render_finished = Vec::with_capacity(images.len());
+        for _ in 0..images.len() {
+            match ctx
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            {
+                Ok(semaphore) => render_finished.push(semaphore),
+                Err(error) => {
+                    for semaphore in render_finished.drain(..) {
+                        ctx.device.destroy_semaphore(semaphore, None);
+                    }
+                    ctx.device.destroy_semaphore(image_available, None);
+                    self.swapchain_loader.destroy_swapchain(swapchain, None);
+                    return Err(DrawError::VkCall(VkCall::new(
+                        VkOp::WindowCreateRenderSemaphore,
+                        error,
+                    )));
+                }
             }
-        };
+        }
         ctx.device.destroy_semaphore(self.image_available, None);
-        ctx.device.destroy_semaphore(self.render_finished, None);
+        for semaphore in self.render_finished.drain() {
+            ctx.device.destroy_semaphore(semaphore, None);
+        }
         self.image_available = image_available;
-        self.render_finished = render_finished;
+        self.render_finished = PerSwapchainImage::new(render_finished);
         self.swapchain = swapchain;
         self.images = images;
         self.extent = extent;
@@ -895,12 +966,21 @@ impl WindowPresenter {
         if self.swapchain == vk::SwapchainKHR::null() || self.recreate_pending {
             self.recreate_swapchain(ctx)?;
         }
-        let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
-            self.swapchain,
-            0,
-            self.image_available,
-            vk::Fence::null(),
-        ) {
+        let (acquire, retry) = acquire_with_bounded_retry(|timeout| {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain,
+                timeout,
+                self.image_available,
+                vk::Fence::null(),
+            )
+        });
+        self.cadence_acquire_retried = self
+            .cadence_acquire_retried
+            .saturating_add(u64::from(retry.attempted));
+        self.cadence_acquire_rescued = self
+            .cadence_acquire_rescued
+            .saturating_add(u64::from(retry.rescued));
+        let (image_index, acquire_suboptimal) = match acquire {
             Ok((index, suboptimal)) => (index, suboptimal),
             Err(vk::Result::NOT_READY) | Err(vk::Result::TIMEOUT) => {
                 self.cadence_busy_acquire = self.cadence_busy_acquire.saturating_add(1);
@@ -1090,7 +1170,8 @@ impl WindowPresenter {
             })?;
             let waits = [self.image_available];
             let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-            let signals = [self.render_finished];
+            let render_finished = *self.render_finished.for_acquired(image_index);
+            let signals = [render_finished];
             let commands = [self.cmd];
             ctx.device
                 .queue_submit(
@@ -1124,7 +1205,7 @@ impl WindowPresenter {
 
         let swapchains = [self.swapchain];
         let indices = [image_index];
-        let waits = [self.render_finished];
+        let waits = [*self.render_finished.for_acquired(image_index)];
         match self.swapchain_loader.queue_present(
             ctx.queue(),
             &vk::PresentInfoKHR::default()
@@ -1414,6 +1495,8 @@ impl WindowPresenter {
                 total: self.cadence_busy,
                 fence: self.cadence_busy_fence,
                 acquire: self.cadence_busy_acquire,
+                acquire_retried: self.cadence_acquire_retried,
+                acquire_rescued: self.cadence_acquire_rescued,
             },
             self.cadence_offered,
         ));
@@ -1424,6 +1507,8 @@ impl WindowPresenter {
         self.cadence_offered = 0;
         self.cadence_busy_fence = 0;
         self.cadence_busy_acquire = 0;
+        self.cadence_acquire_retried = 0;
+        self.cadence_acquire_rescued = 0;
     }
 
     pub(crate) fn release_pins_after_idle(&mut self, pools: &mut ResourcePools) {
@@ -1454,7 +1539,9 @@ impl WindowPresenter {
             staging.destroy(&ctx.device);
         }
         ctx.device.destroy_fence(self.in_flight, None);
-        ctx.device.destroy_semaphore(self.render_finished, None);
+        for semaphore in self.render_finished.drain() {
+            ctx.device.destroy_semaphore(semaphore, None);
+        }
         ctx.device.destroy_semaphore(self.image_available, None);
         ctx.device.destroy_command_pool(self.cmd_pool, None);
         if self.swapchain != vk::SwapchainKHR::null() {
@@ -1505,6 +1592,8 @@ struct CadenceBusy {
     total: u64,
     fence: u64,
     acquire: u64,
+    acquire_retried: u64,
+    acquire_rescued: u64,
 }
 
 fn window_cadence_line(
@@ -1519,9 +1608,10 @@ fn window_cadence_line(
     let offered_hz = offered as f64 * 1_000.0 / window_ms.max(1) as f64;
     format!(
         "host_window_cadence window_ms={window_ms} presents={presents} direct={direct} \
-         busy={} busy_fence={} busy_acquire={} offered={offered} present_hz={hz:.1} \
+         busy={} busy_fence={} busy_acquire={} acquire_retried={} acquire_rescued={} \
+         offered={offered} present_hz={hz:.1} \
          offered_hz={offered_hz:.1} direct_frac={direct_fraction:.2}",
-        busy.total, busy.fence, busy.acquire
+        busy.total, busy.fence, busy.acquire, busy.acquire_retried, busy.acquire_rescued
     )
 }
 
@@ -1705,6 +1795,8 @@ mod tests {
                 total: 131,
                 fence: 100,
                 acquire: 31,
+                acquire_retried: 37,
+                acquire_rescued: 6,
             },
             240,
         );
@@ -1713,6 +1805,8 @@ mod tests {
         assert!(line.contains("busy=131"), "{line}");
         assert!(line.contains("busy_fence=100"), "{line}");
         assert!(line.contains("busy_acquire=31"), "{line}");
+        assert!(line.contains("acquire_retried=37"), "{line}");
+        assert!(line.contains("acquire_rescued=6"), "{line}");
         assert!(line.contains("present_hz=120.0"), "{line}");
         assert!(line.contains("direct_frac=0.99"), "{line}");
     }
@@ -1732,6 +1826,8 @@ mod tests {
                 total: 420,
                 fence: 400,
                 acquire: 20,
+                acquire_retried: 29,
+                acquire_rescued: 9,
             },
             109,
         );
@@ -1873,16 +1969,90 @@ mod tests {
         );
     }
 
+    /// A submit fence says the blit finished, but it does not retire the wait
+    /// performed by `vkQueuePresentKHR`. Only reacquiring the same swapchain
+    /// image proves that present is done with its wait semaphore, so the
+    /// resource follows the acquired image rather than a frame counter.
+    #[test]
+    fn a_present_wait_semaphore_is_reused_only_with_its_swapchain_image() {
+        let per_image = PerSwapchainImage::new(vec!["image-0", "image-1", "image-2"]);
+        let acquired = [0, 1, 2, 1, 0];
+        let selected: Vec<_> = acquired
+            .into_iter()
+            .map(|index| *per_image.for_acquired(index))
+            .collect();
+
+        assert_eq!(
+            selected,
+            ["image-0", "image-1", "image-2", "image-1", "image-0"]
+        );
+    }
+
+    /// An exhausted swapchain must enter the WSI wait/progress path, but the
+    /// engine lock may not be held indefinitely. The policy retries only
+    /// NOT_READY/TIMEOUT, retries exactly once, and reports whether it recovered.
+    #[test]
+    fn an_exhausted_acquire_gets_one_bounded_retry_to_dispatch_releases() {
+        assert_eq!(guest_frame_budget_ns(0), None);
+        assert_eq!(guest_frame_budget_ns(1), Some(NANOS_PER_SECOND));
+        assert_eq!(
+            guest_frame_budget_ns(crate::model::DISPLAY_REFRESH_HZ),
+            Some(ACQUIRE_RETRY_BUDGET_NS)
+        );
+
+        let mut calls = Vec::new();
+        let mut answers = [Err(vk::Result::NOT_READY), Ok(7)].into_iter();
+        let (result, retry) = acquire_with_bounded_retry(|timeout| {
+            calls.push(timeout);
+            answers.next().expect("policy made more than two attempts")
+        });
+        assert_eq!(calls, [0, ACQUIRE_RETRY_BUDGET_NS]);
+        assert_eq!(result, Ok(7));
+        assert_eq!(
+            retry,
+            AcquireRetry {
+                attempted: true,
+                rescued: true
+            }
+        );
+
+        let mut calls = Vec::new();
+        let mut answers = [
+            Err::<(), _>(vk::Result::TIMEOUT),
+            Err::<(), _>(vk::Result::NOT_READY),
+        ]
+        .into_iter();
+        let (result, retry) = acquire_with_bounded_retry(|timeout| {
+            calls.push(timeout);
+            answers.next().expect("policy made more than two attempts")
+        });
+        assert_eq!(calls, [0, ACQUIRE_RETRY_BUDGET_NS]);
+        assert_eq!(result, Err(vk::Result::NOT_READY));
+        assert_eq!(
+            retry,
+            AcquireRetry {
+                attempted: true,
+                rescued: false
+            }
+        );
+
+        let mut calls = Vec::new();
+        let (result, retry) = acquire_with_bounded_retry(|timeout| {
+            calls.push(timeout);
+            Err::<(), _>(vk::Result::ERROR_OUT_OF_DATE_KHR)
+        });
+        assert_eq!(calls, [0]);
+        assert_eq!(result, Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert_eq!(retry, AcquireRetry::default());
+    }
+
     /// A producer faster than the display must supersede frames, not lose them.
     ///
-    /// This rail acquires with a zero timeout because the caller is the drain
-    /// worker and blocking it on a vblank stalls guest command processing. Under
-    /// FIFO an image is only acquirable at a refresh boundary, so a non-blocking
-    /// acquire fails whenever the queue is full and the frame is dropped: a
-    /// driven boot measured `offered=51 presents=20 busy_acquire=330` per
-    /// second, pinned at exactly 20.0 Hz with three fifths of the guest's frames
-    /// never reaching the screen. MAILBOX replaces the pending image instead, so
-    /// an image stays acquirable and the newest frame is the one shown.
+    /// The window probes acquire without waiting, then grants an exhausted WSI
+    /// one bounded retry budget. FIFO routinely needs that wait because an image
+    /// becomes available at a refresh boundary. MAILBOX can need it too when
+    /// buffer releases are waiting in the client event queue, but replacing the
+    /// pending image still ensures the newest submitted frame survives.
     #[test]
     fn the_swapchain_prefers_mailbox_and_falls_back_to_fifo() {
         use super::{choose_present_mode, swapchain_image_count};
