@@ -95,6 +95,46 @@ pub struct Frame {
 pub struct Connection {
     fd: std::os::fd::OwnedFd,
     modifiers: Vec<u64>,
+    cadence: std::sync::Mutex<BridgeCadence>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct BridgeCadence {
+    window_start_ms: Option<u64>,
+    offered: u64,
+    presented: u64,
+    in_flight: u64,
+}
+
+#[cfg(unix)]
+impl BridgeCadence {
+    fn note_offered(&mut self, now_ms: u64) {
+        self.window_start_ms.get_or_insert(now_ms);
+        self.offered = self.offered.saturating_add(1);
+        self.in_flight = self.in_flight.saturating_add(1);
+    }
+
+    fn note_presented(&mut self, now_ms: u64) -> Option<String> {
+        let start_ms = *self.window_start_ms.get_or_insert(now_ms);
+        self.presented = self.presented.saturating_add(1);
+        self.in_flight = self.in_flight.saturating_sub(1);
+        let window_ms = now_ms.saturating_sub(start_ms);
+        if window_ms < 1_000 {
+            return None;
+        }
+        let offered_hz = self.offered as f64 * 1_000.0 / window_ms.max(1) as f64;
+        let present_hz = self.presented as f64 * 1_000.0 / window_ms.max(1) as f64;
+        let line = format!(
+            "frame_bridge_cadence window_ms={window_ms} offered={} presented={} \
+             offered_hz={offered_hz:.1} present_hz={present_hz:.1} in_flight={}",
+            self.offered, self.presented, self.in_flight
+        );
+        self.window_start_ms = Some(now_ms);
+        self.offered = 0;
+        self.presented = 0;
+        Some(line)
+    }
 }
 
 /// One exported image submitted to the compositor. Descriptor ownership moves
@@ -351,7 +391,11 @@ impl Connection {
                 modifiers.push(modifier);
             }
         }
-        Ok(Self { fd, modifiers })
+        Ok(Self {
+            fd,
+            modifiers,
+            cadence: std::sync::Mutex::new(BridgeCadence::default()),
+        })
     }
 
     pub fn raw_fd(&self) -> std::os::fd::RawFd {
@@ -434,6 +478,10 @@ impl Connection {
         if sent != (HEADER_LEN + FRAME_LEN) as isize {
             return Err(std::io::Error::last_os_error());
         }
+        self.cadence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .note_offered(crate::observe::elapsed_ms() as u64);
         let mut reply = [0; HEADER_LEN];
         if unsafe {
             libc::recv(
@@ -458,6 +506,14 @@ impl Connection {
                 std::io::ErrorKind::InvalidData,
                 "bridge released the wrong frame",
             ));
+        }
+        if let Some(line) = self
+            .cadence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .note_presented(crate::observe::elapsed_ms() as u64)
+        {
+            crate::observe::off(line);
         }
         Ok(())
     }
@@ -570,5 +626,39 @@ mod tests {
         bytes[24] = 1;
         bytes[25] = 2;
         assert!(Frame::decode(&bytes).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_cadence_reports_transport_offers_and_release_acknowledgements() {
+        let mut cadence = BridgeCadence::default();
+        cadence.note_offered(100);
+        assert!(cadence.note_presented(200).is_none());
+        cadence.note_offered(600);
+        cadence.note_offered(1_100);
+        let line = cadence.note_presented(1_200).unwrap();
+        assert!(line.contains("window_ms=1100"), "{line}");
+        assert!(line.contains("offered=3"), "{line}");
+        assert!(line.contains("presented=2"), "{line}");
+        assert!(line.contains("offered_hz=2.7"), "{line}");
+        assert!(line.contains("present_hz=1.8"), "{line}");
+        assert!(line.contains("in_flight=1"), "{line}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_cadence_resets_only_window_counts() {
+        let mut cadence = BridgeCadence::default();
+        cadence.note_offered(0);
+        let first = cadence.note_presented(1_000).unwrap();
+        assert!(first.contains("offered=1"), "{first}");
+        assert!(first.contains("presented=1"), "{first}");
+        assert!(first.contains("in_flight=0"), "{first}");
+
+        cadence.note_offered(1_500);
+        let second = cadence.note_presented(2_000).unwrap();
+        assert!(second.contains("offered=1"), "{second}");
+        assert!(second.contains("presented=1"), "{second}");
+        assert!(second.contains("in_flight=0"), "{second}");
     }
 }
