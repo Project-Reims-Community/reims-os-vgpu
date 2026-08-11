@@ -277,6 +277,12 @@ pub(crate) struct DeviceContext {
     /// `None` is the answer on every host without the extension, and the import
     /// site declines by name when it sees one.
     pub external_memory_host: Option<ash::ext::external_memory_host::Device>,
+    /// DMA-BUF image export and sync-fd semaphore export used by the direct
+    /// compositor bridge. Both are present or both absent: publishing an image
+    /// without a completion primitive would expose pixels while Vulkan still
+    /// owns their writes.
+    pub bridge_external_memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    pub bridge_external_semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
     /// Queue family used for all engine submits (graphics draws + compute).
     pub gq: u32,
     /// True when `gq` supports both GRAPHICS and COMPUTE (required for engine compute).
@@ -586,6 +592,11 @@ impl DeviceContext {
         let vertex_attribute_divisor = has_device_extension(vk::KHR_VERTEX_ATTRIBUTE_DIVISOR_NAME);
         #[cfg(feature = "host-window")]
         let swapchain = has_device_extension(ash::khr::swapchain::NAME);
+        let bridge_export = std::env::var_os("REIMS_VGPU_FRAME_BRIDGE").is_some()
+            && has_device_extension(ash::khr::external_memory_fd::NAME)
+            && has_device_extension(ash::khr::external_semaphore_fd::NAME)
+            && has_device_extension(ash::ext::external_memory_dma_buf::NAME)
+            && has_device_extension(ash::ext::image_drm_format_modifier::NAME);
         // Combined depth-stencil format for the stencil-test path. The Vulkan
         // spec guarantees at least ONE of D32_SFLOAT_S8_UINT / D24_UNORM_S8_UINT
         // supports DEPTH_STENCIL_ATTACHMENT (required-format table) — but NOT
@@ -638,6 +649,14 @@ impl DeviceContext {
         #[cfg(feature = "host-window")]
         if swapchain {
             enabled_device_extensions.push(ash::khr::swapchain::NAME.as_ptr());
+        }
+        if bridge_export {
+            enabled_device_extensions.extend([
+                ash::khr::external_memory_fd::NAME.as_ptr(),
+                ash::khr::external_semaphore_fd::NAME.as_ptr(),
+                ash::ext::external_memory_dma_buf::NAME.as_ptr(),
+                ash::ext::image_drm_format_modifier::NAME.as_ptr(),
+            ]);
         }
         let mut enabled_divisor_features =
             vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default()
@@ -708,7 +727,8 @@ impl DeviceContext {
         // so a device that declines it is out of spec — which is exactly why the
         // answer is read from `features` rather than assumed: an assumption here
         // is a `vkWaitSemaphores` into a driver that never implemented it.
-        let stamp_completion = features.timeline_semaphore
+        let stamp_completion = features
+            .timeline_semaphore
             .then(|| super::stamp_completion::StampCompletion::start(&device))
             .transpose()
             .map_err(|e| {
@@ -735,6 +755,10 @@ impl DeviceContext {
             .host_pointer
             .is_available()
             .then(|| ash::ext::external_memory_host::Device::new(&instance, &device));
+        let bridge_external_memory_fd =
+            bridge_export.then(|| ash::khr::external_memory_fd::Device::new(&instance, &device));
+        let bridge_external_semaphore_fd =
+            bridge_export.then(|| ash::khr::external_semaphore_fd::Device::new(&instance, &device));
         let device_name = CStr::from_ptr(props.device_name.as_ptr())
             .to_string_lossy()
             .into_owned();
@@ -769,6 +793,11 @@ impl DeviceContext {
             compute_capable,
             caps.quirks.no_deferred_draw_batching,
             caps.quirks.guest_pages_stay_authoritative,
+        ));
+        crate::observe::off(format!(
+            "vk_frame_bridge_export available={bridge_export} memory_fd={} semaphore_fd={}",
+            bridge_external_memory_fd.is_some(),
+            bridge_external_semaphore_fd.is_some(),
         ));
         // Warm-start the pipeline cache from the previous boot's blob. Cold
         // pipeline compiles are the remaining pre-convergence stall class
@@ -820,6 +849,8 @@ impl DeviceContext {
             caps,
             memory_properties,
             external_memory_host,
+            bridge_external_memory_fd,
+            bridge_external_semaphore_fd,
             gq,
             compute_capable,
             storage_image_write_without_format: storage_image_write_without_format_bgra,
@@ -987,7 +1018,6 @@ impl DeviceContext {
     pub(crate) fn queue(&self) -> vk::Queue {
         unsafe { self.device.get_device_queue(self.gq, 0) }
     }
-
 }
 
 /// The index of a queue family that transfers and does nothing else — a copy

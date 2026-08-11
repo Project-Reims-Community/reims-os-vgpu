@@ -131,6 +131,12 @@ struct BoundDevice {
     /// boot (the window is opt-in behind `REIMS_VGPU_WINDOW`).
     #[cfg(feature = "host-window")]
     window: Mutex<std::collections::BTreeMap<u32, window_publish::WindowLink>>,
+    /// Direct compositor transport. During bring-up this lives beside the
+    /// legacy host window and proves lifecycle before either owns frame fds.
+    #[cfg(feature = "host-window")]
+    frame_bridge: Mutex<Option<crate::frame_bridge::Publisher>>,
+    #[cfg(feature = "host-window")]
+    frame_bridge_modifiers: Mutex<Vec<u64>>,
     /// Early-boot framebuffer (BAR1 GOP) registered by the C shim, shown in the
     /// window until the product present path latches.
     #[cfg(feature = "host-window")]
@@ -275,6 +281,9 @@ pub fn device_create_with_display_ports(
             ops,
             #[cfg(feature = "host-window")]
             window: Mutex::new(std::collections::BTreeMap::new()),
+            #[cfg(feature = "host-window")]
+            frame_bridge: Mutex::new(None),
+            frame_bridge_modifiers: Mutex::new(Vec::new()),
             #[cfg(feature = "host-window")]
             early_fb: Mutex::new(None),
             #[cfg(feature = "host-window")]

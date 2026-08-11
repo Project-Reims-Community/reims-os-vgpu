@@ -119,6 +119,30 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
+    if let Some(path) = std::env::var_os("REIMS_VGPU_FRAME_BRIDGE") {
+        let mut bridge = slot.frame_bridge.lock();
+        if bridge.is_none() {
+            match crate::frame_bridge::Connection::connect(std::path::Path::new(&path), id as u32) {
+                Ok(connection) => {
+                    *slot.frame_bridge_modifiers.lock() = connection.modifiers().to_vec();
+                    crate::observe::off(format!(
+                        "frame_bridge state=ready fd={} modifiers={}",
+                        connection.raw_fd(),
+                        connection.modifiers().len()
+                    ));
+                    match crate::frame_bridge::Publisher::new(connection) {
+                        Ok(publisher) => *bridge = Some(publisher),
+                        Err(error) => crate::observe::fail(format!(
+                            "frame_bridge state=worker-unavailable error={error}"
+                        )),
+                    }
+                }
+                Err(error) => {
+                    crate::observe::fail(format!("frame_bridge state=unavailable error={error}"));
+                }
+            }
+        }
+    }
     let display_count = slot.inner.lock().device.state.display_port_count;
     let mut links = slot.window.lock();
     if links.len() == display_count as usize {
@@ -283,8 +307,22 @@ pub fn device_window_run_main(_id: u64) -> bool {
 #[cfg(feature = "host-window")]
 pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
     use crate::runtime::drain::{note_window_publish, WindowPublish};
-    let mut guard = slot.window.lock();
     let display_index = state.present_display_index;
+    let bridge_prepared = if slot.frame_bridge.lock().is_some()
+        && state.present.frame_valid
+        && state.present.frame_width != 0
+        && state.present.frame_height != 0
+    {
+        crate::backend::vulkan::engine::frame_bridge_prepare(
+            display_index,
+            state.present.frame_width,
+            state.present.frame_height,
+            &slot.frame_bridge_modifiers.lock(),
+        )
+    } else {
+        false
+    };
+    let mut guard = slot.window.lock();
     let Some(link) = guard.get_mut(&display_index) else {
         // No window consumes the capture: revert the next capture to the full
         // readback path (a torn-down window must not leave `frame_bgra` stale
@@ -327,6 +365,24 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     }
     let present_identity =
         crate::runtime::present_identity::surface_identity(state, mapping, width, height);
+    if bridge_prepared {
+        let source = crate::backend::vulkan::engine::WindowPresentSource {
+            width,
+            height,
+            identity: present_identity.clone(),
+        };
+        match crate::backend::vulkan::engine::frame_bridge_frame(display_index, &source) {
+            Ok(Some(frame)) => {
+                if let Some(publisher) = slot.frame_bridge.lock().as_ref() {
+                    publisher.publish(frame);
+                }
+            }
+            Ok(None) => {}
+            Err(error) => crate::observe::fail(format!(
+                "frame_bridge publish=failed display={display_index} error={error}"
+            )),
+        }
+    }
     // Keep the resident this present names alive across the idle sweep below,
     // then reclaim targets idle past the wall-clock age threshold so VRAM returns
     // to the working-set baseline after a compositing burst instead of being held
@@ -334,6 +390,13 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     let now_ms = crate::observe::elapsed_ms() as u64;
     crate::backend::vulkan::engine::touch_resident_target(Some(&present_identity), now_ms);
     crate::backend::vulkan::engine::maintain_idle_residents(Some(&present_identity), now_ms);
+    if bridge_prepared
+        && crate::env::switch(crate::env::FRAME_BRIDGE_ONLY) == crate::env::Switch::On
+    {
+        link.last = key;
+        state.present.display_from_resident = true;
+        return;
+    }
     // The window presenting from the engine's own device can take the resident
     // as it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set

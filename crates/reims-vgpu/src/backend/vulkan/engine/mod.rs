@@ -7,6 +7,8 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(feature = "host-window")]
+mod bridge_export;
 mod buffer_slab;
 mod caches;
 mod compute_execution;
@@ -187,6 +189,10 @@ struct EngineState {
     counters: EngineCounters,
     #[cfg(feature = "host-window")]
     window_presenters: std::collections::BTreeMap<u32, window_present::WindowPresenter>,
+    #[cfg(feature = "host-window")]
+    bridge_export_slots: std::collections::BTreeMap<u32, Vec<bridge_export::ExportSlot>>,
+    #[cfg(feature = "host-window")]
+    bridge_export_declines: std::collections::BTreeMap<u32, (u32, u32)>,
 }
 
 impl EngineState {
@@ -198,6 +204,10 @@ impl EngineState {
             counters: EngineCounters::default(),
             #[cfg(feature = "host-window")]
             window_presenters: std::collections::BTreeMap::new(),
+            #[cfg(feature = "host-window")]
+            bridge_export_slots: std::collections::BTreeMap::new(),
+            #[cfg(feature = "host-window")]
+            bridge_export_declines: std::collections::BTreeMap::new(),
         }
     }
 
@@ -208,6 +218,14 @@ impl EngineState {
                 for (_, mut presenter) in std::mem::take(&mut self.window_presenters) {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
+                #[cfg(feature = "host-window")]
+                for (_, slots) in std::mem::take(&mut self.bridge_export_slots) {
+                    for slot in slots {
+                        slot.destroy(ctx);
+                    }
+                }
+                #[cfg(feature = "host-window")]
+                self.bridge_export_declines.clear();
                 self.caches.destroy_all(&ctx.device);
                 self.pools.destroy_all(&ctx.device);
             }
@@ -526,6 +544,115 @@ pub fn window_present_attached(display_index: u32) -> bool {
     WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire) & bit != 0
 }
 
+/// Allocate and validate the direct bridge's concrete DMA-BUF image once per
+/// output. This is intentionally separate from publication: callers can keep
+/// the legacy window alive when the host declines the exact export layout.
+#[cfg(feature = "host-window")]
+pub fn frame_bridge_prepare(
+    display_index: u32,
+    width: u32,
+    height: u32,
+    offered_modifiers: &[u64],
+) -> bool {
+    let mut guard = lock_engine_at(EngineLockSite::Window);
+    if let Some(slots) = guard.bridge_export_slots.get(&display_index) {
+        return slots
+            .first()
+            .is_some_and(|slot| slot.width == width && slot.height == height);
+    }
+    if guard.bridge_export_declines.get(&display_index) == Some(&(width, height)) {
+        return false;
+    }
+    let EngineState {
+        ref mut owner,
+        ref counters,
+        ref mut bridge_export_slots,
+        ref mut bridge_export_declines,
+        ..
+    } = &mut *guard;
+    let ctx = match owner.ensure(counters) {
+        Ok(ctx) => ctx,
+        Err(error) => {
+            crate::observe::fail(format!("frame_bridge export=declined error={error}"));
+            return false;
+        }
+    };
+    let mut slots = Vec::new();
+    let created = (|| {
+        for slot_id in 0..3 {
+            slots.push(unsafe {
+                bridge_export::ExportSlot::create(
+                    ctx,
+                    width,
+                    height,
+                    offered_modifiers,
+                    slot_id,
+                )?
+            });
+        }
+        Ok::<(), String>(())
+    })();
+    match created {
+        Ok(()) => {
+            let slot = &slots[0];
+            crate::observe::off(format!(
+                "frame_bridge export=ready display={display_index} size={width}x{height} slots=3 modifier={:#018x} offset={} stride={}",
+                slot.modifier, slot.offset, slot.stride
+            ));
+            bridge_export_slots.insert(display_index, slots);
+            bridge_export_declines.remove(&display_index);
+            true
+        }
+        Err(error) => {
+            unsafe {
+                for slot in slots {
+                    slot.destroy(ctx);
+                }
+            }
+            crate::observe::fail(format!(
+                "frame_bridge export=declined display={display_index} size={width}x{height} error={error}"
+            ));
+            bridge_export_declines.insert(display_index, (width, height));
+            false
+        }
+    }
+}
+
+/// Copy the current resident into a free export slot and return its DMA-BUF
+/// descriptors. `None` is normal backpressure: the compositor still owns all
+/// three slots, so the latest guest frame is skipped without blocking drain.
+#[cfg(feature = "host-window")]
+pub fn frame_bridge_frame(
+    display_index: u32,
+    source: &WindowPresentSource,
+) -> Result<Option<crate::frame_bridge::PublishedFrame>, String> {
+    let mut guard = lock_engine_at(EngineLockSite::Window);
+    let EngineState {
+        ref mut owner,
+        ref mut pools,
+        ref counters,
+        ref mut bridge_export_slots,
+        ..
+    } = &mut *guard;
+    let ctx = owner.ensure(counters).map_err(|error| error.to_string())?;
+    unsafe { pools.batch_flush(ctx, counters) }.map_err(|error| error.to_string())?;
+    let Some((image, access)) = pools.registry_get(&source.identity).and_then(|slot| {
+        pools::slot_presentable(slot, source.width, source.height)
+            .then_some((slot.image, slot.access))
+    }) else {
+        return Ok(None);
+    };
+    let Some(slot) = bridge_export_slots
+        .get_mut(&display_index)
+        .and_then(|slots| slots.iter_mut().find(|slot| slot.available()))
+    else {
+        return Ok(None);
+    };
+    let frame = unsafe { slot.publish(ctx, display_index, image, access) }?;
+    pools.registry_note_access(&source.identity, pools::ResidentAccess::TransferRead);
+    Ok(Some(frame))
+}
+
 #[cfg(feature = "host-window")]
 pub fn window_present_resize(display_index: u32, width: u32, height: u32) {
     let mut guard = lock_engine_at(EngineLockSite::Window);
@@ -773,7 +900,9 @@ fn arm_guest_write_pages(pages: &[u64]) {
         return;
     };
     let mut sorted = pages.to_vec();
-    sorted.sort_unstable();
+    if !sorted.is_sorted() {
+        sorted.sort_unstable();
+    }
     sorted.dedup();
     // At the entry cap, fold into the oldest rather than give up naming. The
     // `first_mut` cannot be `None` there — `RING_DEPTH` is non-zero — but the
@@ -781,14 +910,49 @@ fn arm_guest_write_pages(pages: &[u64]) {
     // panic here would protect is a bound this function does not own.
     if f.armed.len() >= pools::RING_DEPTH {
         if let Some(oldest) = f.armed.first_mut() {
-            oldest.extend_from_slice(&sorted);
-            oldest.sort_unstable();
-            oldest.dedup();
+            merge_sorted_unique(oldest, &sorted);
             crate::runtime::drain::note_store_route("gwdebt_merged");
             return;
         }
     }
     f.armed.push(sorted);
+}
+
+/// Union `incoming` into the sorted, unique `held` footprint.
+///
+/// Overflow is the hot shape here: a driven desktop repeatedly writes the same
+/// handful of full-screen surfaces after the ledger reaches its eight-entry
+/// cap. Extending and sorting the growing union for every one of those writes
+/// made page-footprint bookkeeping part of the draw critical path. Most such
+/// arms are subsets, so prove that first without allocating; otherwise merge
+/// the two already-sorted sets in linear time.
+fn merge_sorted_unique(held: &mut Vec<u64>, incoming: &[u64]) {
+    if incoming.iter().all(|page| held.binary_search(page).is_ok()) {
+        return;
+    }
+
+    let previous = std::mem::take(held);
+    held.reserve(previous.len().saturating_add(incoming.len()));
+    let (mut left, mut right) = (0, 0);
+    while left < previous.len() && right < incoming.len() {
+        match previous[left].cmp(&incoming[right]) {
+            std::cmp::Ordering::Less => {
+                held.push(previous[left]);
+                left += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                held.push(incoming[right]);
+                right += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                held.push(previous[left]);
+                left += 1;
+                right += 1;
+            }
+        }
+    }
+    held.extend_from_slice(&previous[left..]);
+    held.extend_from_slice(&incoming[right..]);
 }
 
 /// Forget the outstanding writebacks' pages. Called under the engine lock, after
@@ -3183,6 +3347,22 @@ mod group_by_buffer_tests {
 #[cfg(test)]
 mod guest_write_footprint_tests {
     use super::*;
+
+    #[test]
+    fn footprint_union_keeps_order_deduplicates_and_handles_subsets() {
+        let mut held = vec![2, 4, 8, 16];
+        merge_sorted_unique(&mut held, &[1, 4, 7, 16, 32]);
+        assert_eq!(held, vec![1, 2, 4, 7, 8, 16, 32]);
+
+        let capacity = held.capacity();
+        merge_sorted_unique(&mut held, &[2, 7, 32]);
+        assert_eq!(held, vec![1, 2, 4, 7, 8, 16, 32]);
+        assert_eq!(
+            held.capacity(),
+            capacity,
+            "a repeated surface must not rebuild the accumulated footprint"
+        );
+    }
 
     /// The whole point: a reader whose window shares no page with the
     /// outstanding writeback is let through, and one that shares a single page

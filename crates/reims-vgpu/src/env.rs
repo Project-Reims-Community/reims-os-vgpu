@@ -46,6 +46,12 @@ pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 /// path unchanged.
 pub const CURSOR_OVERLAY: &str = "REIMS_VGPU_CURSOR";
 
+/// Publish completed frames only through the compositor frame bridge. The host
+/// window remains available as an input endpoint during bridge bring-up, but it
+/// does not acquire a swapchain image or present a duplicate copy of each guest
+/// frame.
+pub const FRAME_BRIDGE_ONLY: &str = "REIMS_VGPU_FRAME_BRIDGE_ONLY";
+
 /// Setting this off makes a completion stamp that follows a guest-page writeback
 /// block the drain worker on that writeback and then write the stamp word
 /// itself, instead of recording the word into the same GPU queue behind the
