@@ -204,6 +204,9 @@ pub enum HostActionKind {
     /// the window is the VM's display, so closing it is closing the machine.
     /// See [`HostAction::window_closed`].
     WindowClosed = 11,
+    /// Relative pointer motion for a multi-display desktop. `a0`/`a1` carry
+    /// signed x/y deltas as two's-complement `i64` values.
+    InputPointerRelative = 12,
 }
 
 /// One queued action, in the exact layout the C `ReimsVgpuHostAction` declares.
@@ -310,6 +313,16 @@ impl HostAction {
             a1: u64::from(y),
             a2: u64::from(width),
             a3: u64::from(height),
+        }
+    }
+
+    pub fn input_pointer_relative(dx: i32, dy: i32) -> Self {
+        Self {
+            kind: HostActionKind::InputPointerRelative,
+            a0: (dx as i64) as u64,
+            a1: (dy as i64) as u64,
+            a2: 0,
+            a3: 0,
         }
     }
 
@@ -1745,6 +1758,10 @@ mod tests {
             (
                 "REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED",
                 HostActionKind::WindowClosed,
+            ),
+            (
+                "REIMS_VGPU_HOST_ACTION_INPUT_POINTER_RELATIVE",
+                HostActionKind::InputPointerRelative,
             ),
         ] {
             assert_eq!(

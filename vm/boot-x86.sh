@@ -122,6 +122,7 @@ Env: DISKS_DIR OVMF_DIR SNAPSHOTS_DIR RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTE
      (metal|vulkan for qemu-build)
      NET=user (SLIRP, default) | NET=none (no NIC)
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
+     REIMS_VGPU_DISPLAY_COUNT=1..8          (optional independent display-pipe count)
      REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
      QEMU_REBOOT_ACTION=exit|pause|reset
        (default exit — guest reboot/KP-reset → QEMU quits; serial already on disk)
@@ -309,21 +310,28 @@ fi
 
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
+USB2_PORTS=4
+POINTER_DEVICES=(-device usb-tablet,bus=xhci.0)
 QEMU_ARGS=(
   -enable-kvm
   -m "$RAM"
   -cpu "${CPU_MODEL},-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
   -machine q35
   -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
-  -device qemu-xhci,id=xhci
+  # Four USB 2.0 ports keep the keyboard, tablet, passed-through Logitech
+  # receiver, and audio device directly on xHCI with no inserted hub.
+  -device "qemu-xhci,id=xhci,p2=$USB2_PORTS"
   -device usb-kbd,bus=xhci.0
-  -device usb-tablet,bus=xhci.0
+  "${POINTER_DEVICES[@]}"
+  # Logitech USB receiver: passed directly to macOS so the guest owns cursor
+  # acceleration, display crossing, buttons, and its hardware cursor plane.
+  -device usb-host,bus=xhci.0,vendorid=0x046d,productid=0xc53f
   -device usb-ehci,id=ehci
   -device isa-applesmc,osk="ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc"
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$OVMF_VARS"
   -smbios type=2
-  -audiodev sdl,id=audio0
+  -audiodev none,id=audio0
   -device usb-audio,bus=xhci.0,audiodev=audio0
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
@@ -366,6 +374,9 @@ case "$GFX_DEVICE" in
       fi
     fi
     _reims_vgpu_dev="reims-vgpu-pci,id=reimsvgpu"
+    if [ -n "${REIMS_VGPU_DISPLAY_COUNT:-}" ]; then
+      _reims_vgpu_dev="${_reims_vgpu_dev},display-count=${REIMS_VGPU_DISPLAY_COUNT}"
+    fi
     if [ -n "${REIMS_VGPU_GOP_ROM:-}" ] && [ -f "$REIMS_VGPU_GOP_ROM" ]; then
       _reims_vgpu_dev="${_reims_vgpu_dev},romfile=${REIMS_VGPU_GOP_ROM},rombar=1"
       echo "boot-x86.sh: reims-vgpu-pci UEFI GOP romfile=$REIMS_VGPU_GOP_ROM"

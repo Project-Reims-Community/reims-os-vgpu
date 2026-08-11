@@ -67,7 +67,7 @@ pub fn gfx_read(state: &mut DeviceState, offset: u64, size: u32) -> u64 {
         GFX_REG_EFI_FB_MODE => state.gfx.efi_fb_mode as u64,
         GFX_REG_EFI_STRIDE_ALIGN => EFI_STRIDE_ALIGNMENT as u64,
         GFX_REG_EFI_FB_STRIDE => state.gfx.efi_fb_stride as u64,
-        GFX_REG_EFI_DISPLAY_PORTS => EFI_DISPLAY_PORT_COUNT as u64,
+        GFX_REG_EFI_DISPLAY_PORTS => state.display_port_count as u64,
         GFX_REG_EFI_BUILTIN_CONNECTED => EFI_BUILTIN_CONNECTED as u64,
         _ => state.gfx.sparse_get(offset) as u64,
     }

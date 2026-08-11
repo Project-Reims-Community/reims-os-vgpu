@@ -78,6 +78,9 @@ pub(crate) struct WindowLink {
     /// (firmware framebuffer, a cleared-but-never-rendered mapping, the frames
     /// after a device reset) is normal on macOS too.
     bgra_short_geom: Option<(u32, u32)>,
+    /// Cursor identity last sent to this display's frame slot. Cursor motion
+    /// does not produce a DisplaySwap, so it has its own publication key.
+    last_cursor: Option<CursorFingerprint>,
     /// Set to ask the window thread to exit (VM teardown); the thread polls it.
     stop: crate::host_window::present::StopFlag,
     /// Window thread handle. `device_window_stop` sets `stop` and joins it, so
@@ -116,103 +119,133 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let mut link = slot.window.lock();
-    if link.is_some() {
+    let display_count = slot.inner.lock().device.state.display_port_count;
+    let mut links = slot.window.lock();
+    if links.len() == display_count as usize {
         return true; // already running (idempotent)
     }
-    // FrameSlot is a std::sync::Mutex (owned by the window module); lib.rs's
-    // bare `Mutex` is parking_lot, so qualify it here.
-    let frames: FrameSlot = Arc::new(std::sync::Mutex::new(None));
-    // Created here rather than on the window thread so the link holds it before
-    // the loop exists: an unarmed waker is a no-op and the window's backstop
-    // covers the gap, so a publish that beats the loop's creation costs latency
-    // rather than a frame.
-    let wake = WindowWaker::new();
-    // Weak so a live window does not pin a destroyed device; post-destroy input
-    // upgrades to None and is dropped (the guest is gone anyway).
-    let weak = Arc::downgrade(&slot);
-    let on_input: InputSink = Arc::new(move |action: HostAction| {
-        let Some(dev) = weak.upgrade() else {
-            return;
-        };
-        dev.prompt_actions.lock().push_back(action);
-        // Wake the HostAction-delivery BH so the guest sees the input without
-        // waiting for the next drain tranche (same rail as IRQ/cursor).
-        if let Some(ops) = dev.ops {
-            if let Some(notify) = ops.notify_actions {
-                // SAFETY: QEMU owns ctx for the device lifetime; notify_actions
-                // is the thread-safe BH-schedule callback.
-                unsafe { notify(ops.ctx) }
-            }
-        }
-    });
-    let cfg = WindowConfig {
-        title: "Reims vGPU".to_string(),
-        width: if width == 0 {
-            crate::model::EFI_BOOT_WIDTH
-        } else {
-            width
-        },
-        height: if height == 0 {
-            crate::model::EFI_BOOT_HEIGHT
-        } else {
-            height
-        },
-    };
-    let stop: crate::host_window::present::StopFlag =
-        Arc::new(std::sync::atomic::AtomicBool::new(false));
-    #[cfg(target_os = "macos")]
-    let (thread, exited) = {
-        let exited: crate::host_window::present::ExitedFlag =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if let Err(error) = crate::host_window::present::start_main_thread(
-            id,
-            cfg,
-            on_input,
-            Arc::clone(&frames),
-            Arc::clone(&stop),
-            Arc::clone(&exited),
-            Arc::clone(&wake),
-        ) {
-            crate::observe::Emit::decline("host_window_start", &error)
-                .field("id", id)
-                .fail();
-            return false;
-        }
-        (None, exited)
-    };
     #[cfg(not(target_os = "macos"))]
-    let thread = Some(crate::host_window::present::spawn(
-        cfg,
-        on_input,
-        Arc::clone(&frames),
-        Arc::clone(&stop),
-        Arc::clone(&wake),
-    ));
-    *link = Some(WindowLink {
-        frames,
-        wake,
-        last: (u32::MAX, u32::MAX, u64::MAX),
-        seq: 0,
-        bgra_short_geom: None,
-        stop,
-        thread,
-        #[cfg(target_os = "macos")]
-        exited,
-    });
-    crate::observe::off(format!(
-        "host_window_start id={id} {}x{}",
-        if width == 0 {
-            crate::model::EFI_BOOT_WIDTH
-        } else {
-            width
-        },
-        if height == 0 {
-            crate::model::EFI_BOOT_HEIGHT
-        } else {
-            height
+    let shared_stop: crate::host_window::present::StopFlag =
+        Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(not(target_os = "macos"))]
+    let mut specs = Vec::new();
+    for display_index in 0..display_count {
+        if links.contains_key(&display_index) {
+            continue;
         }
-    ));
+        // FrameSlot is a std::sync::Mutex (owned by the window module); lib.rs's
+        // bare `Mutex` is parking_lot, so qualify it here.
+        let frames: FrameSlot = Arc::new(std::sync::Mutex::new(None));
+        // Created here rather than on the window thread so the link holds it before
+        // the loop exists: an unarmed waker is a no-op and the window's backstop
+        // covers the gap, so a publish that beats the loop's creation costs latency
+        // rather than a frame.
+        let wake = WindowWaker::new(display_index);
+        // Weak so a live window does not pin a destroyed device; post-destroy input
+        // upgrades to None and is dropped (the guest is gone anyway).
+        let weak = Arc::downgrade(&slot);
+        let on_input: InputSink = Arc::new(move |action: HostAction| {
+            let Some(dev) = weak.upgrade() else {
+                return;
+            };
+            dev.prompt_actions.lock().push_back(action);
+            // Wake the HostAction-delivery BH so the guest sees the input without
+            // waiting for the next drain tranche (same rail as IRQ/cursor).
+            if let Some(ops) = dev.ops {
+                if let Some(notify) = ops.notify_actions {
+                    // SAFETY: QEMU owns ctx for the device lifetime; notify_actions
+                    // is the thread-safe BH-schedule callback.
+                    unsafe { notify(ops.ctx) }
+                }
+            }
+        });
+        let cfg = WindowConfig {
+            display_index,
+            display_count,
+            title: format!("Reims vGPU — Display {}", display_index + 1),
+            width: if width == 0 {
+                crate::model::EFI_BOOT_WIDTH
+            } else {
+                width
+            },
+            height: if height == 0 {
+                crate::model::EFI_BOOT_HEIGHT
+            } else {
+                height
+            },
+        };
+        #[cfg(target_os = "macos")]
+        let stop: crate::host_window::present::StopFlag =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(not(target_os = "macos"))]
+        let stop = Arc::clone(&shared_stop);
+        #[cfg(target_os = "macos")]
+        let (thread, exited) = {
+            let exited: crate::host_window::present::ExitedFlag =
+                Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Err(error) = crate::host_window::present::start_main_thread(
+                id,
+                cfg,
+                on_input,
+                Arc::clone(&frames),
+                Arc::clone(&stop),
+                Arc::clone(&exited),
+                Arc::clone(&wake),
+            ) {
+                crate::observe::Emit::decline("host_window_start", &error)
+                    .field("id", id)
+                    .fail();
+                return false;
+            }
+            (None, exited)
+        };
+        #[cfg(not(target_os = "macos"))]
+        {
+            specs.push(crate::host_window::present::WindowSpec {
+                config: cfg,
+                on_input,
+                frames: Arc::clone(&frames),
+                wake: Arc::clone(&wake),
+            });
+        }
+        #[cfg(not(target_os = "macos"))]
+        let thread = None;
+        links.insert(
+            display_index,
+            WindowLink {
+                frames,
+                wake,
+                last: (u32::MAX, u32::MAX, u64::MAX),
+                seq: 0,
+                bgra_short_geom: None,
+                last_cursor: None,
+                stop,
+                thread,
+                #[cfg(target_os = "macos")]
+                exited,
+            },
+        );
+        crate::observe::off(format!(
+            "host_window_start id={id} display={display_index} {}x{}",
+            if width == 0 {
+                crate::model::EFI_BOOT_WIDTH
+            } else {
+                width
+            },
+            if height == 0 {
+                crate::model::EFI_BOOT_HEIGHT
+            } else {
+                height
+            }
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    if !specs.is_empty() {
+        let thread = crate::host_window::present::spawn_many(specs, Arc::clone(&shared_stop));
+        if let Some(primary) = links.get_mut(&0) {
+            primary.thread = Some(thread);
+        }
+    }
     true
 }
 
@@ -251,7 +284,8 @@ pub fn device_window_run_main(_id: u64) -> bool {
 pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model::DeviceState) {
     use crate::runtime::drain::{note_window_publish, WindowPublish};
     let mut guard = slot.window.lock();
-    let Some(link) = guard.as_mut() else {
+    let display_index = state.present_display_index;
+    let Some(link) = guard.get_mut(&display_index) else {
         // No window consumes the capture: revert the next capture to the full
         // readback path (a torn-down window must not leave `frame_bgra` stale
         // behind an unreset `display_from_resident`).
@@ -267,8 +301,14 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     let key = window_frame_key(p);
     if key == link.last {
         note_window_publish(WindowPublish::SameKey);
+        let fingerprint = cursor_fingerprint(state);
+        if fingerprint.is_some() && fingerprint != link.last_cursor {
+            link.last_cursor = fingerprint;
+            republish_cursor(link, cursor_snapshot(state));
+        }
         return;
     }
+    link.last_cursor = cursor_fingerprint(state);
     note_window_publish(WindowPublish::Fresh);
     // Copied out rather than held behind `p`: the branches below assign
     // `state.present.display_from_resident`, and the frame bytes are the only
@@ -298,7 +338,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // as it stands, so the frame never crosses host memory. `display_from_resident`
     // is what tells the NEXT capture not to read it back, and it is only set
     // when a resident actually carried this one.
-    if crate::backend::vulkan::engine::window_present_attached()
+    if crate::backend::vulkan::engine::window_present_attached(display_index)
         && crate::backend::vulkan::engine::resident_presentable(&present_identity, width, height)
     {
         let resident_source = crate::backend::vulkan::engine::WindowPresentSource {
@@ -306,7 +346,14 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
             height,
             identity: present_identity,
         };
-        let published = window_write_frame(link, width, height, Vec::new(), Some(resident_source));
+        let published = window_write_frame(
+            link,
+            width,
+            height,
+            Vec::new(),
+            Some(resident_source),
+            cursor_snapshot(state),
+        );
         crate::runtime::census::present_proxy::window_publish::note(published);
         if published {
             link.last = key;
@@ -318,7 +365,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // copies the whole framebuffer through host memory on every frame and the
     // difference between the two is the window's frame rate. Silence here is
     // what let `direct_frac` sit at 0.00 for a whole boot with no cause named.
-    if !crate::backend::vulkan::engine::window_present_attached() {
+    if !crate::backend::vulkan::engine::window_present_attached(display_index) {
         crate::runtime::drain::note_store_route("winpub_window_not_attached");
     } else if let Some(route) = crate::backend::vulkan::engine::resident_present_decline_route(
         &present_identity,
@@ -362,7 +409,7 @@ pub(crate) fn publish_window_frame(slot: &BoundDevice, state: &mut crate::model:
     // so a later mismatch at the same geometry logs again.
     link.bgra_short_geom = None;
     let bgra = state.present.frame_bgra[..need].to_vec();
-    let published = window_write_frame(link, width, height, bgra, None);
+    let published = window_write_frame(link, width, height, bgra, None, cursor_snapshot(state));
     crate::runtime::census::present_proxy::window_publish::note(published);
     if published {
         link.last = key;
@@ -386,6 +433,7 @@ fn window_write_frame(
     height: u32,
     bgra: Vec<u8>,
     resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    cursor: Option<crate::host_window::present::CursorOverlay>,
 ) -> bool {
     link.seq = link.seq.wrapping_add(1);
     let frame = std::sync::Arc::new(crate::host_window::present::Frame {
@@ -394,6 +442,7 @@ fn window_write_frame(
         height,
         bgra,
         resident,
+        cursor,
     });
     let stored = match link.frames.lock() {
         Ok(mut slot_frame) => {
@@ -408,6 +457,122 @@ fn window_write_frame(
     stored
 }
 
+#[cfg(feature = "host-window")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorFingerprint {
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+    hot_x: u16,
+    hot_y: u16,
+    visible: bool,
+    pixels: u64,
+}
+
+#[cfg(feature = "host-window")]
+fn cursor_overlay_enabled() -> bool {
+    crate::env::switch(crate::env::CURSOR_OVERLAY) == crate::env::Switch::On
+}
+
+#[cfg(feature = "host-window")]
+fn cursor_fingerprint(state: &crate::model::DeviceState) -> Option<CursorFingerprint> {
+    cursor_fingerprint_from(state, cursor_overlay_enabled())
+}
+
+#[cfg(feature = "host-window")]
+fn cursor_fingerprint_from(
+    state: &crate::model::DeviceState,
+    enabled: bool,
+) -> Option<CursorFingerprint> {
+    use std::hash::{Hash, Hasher};
+    if !enabled {
+        return None;
+    }
+    let cursor = &state.cursor;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    cursor.pixels.hash(&mut hash);
+    Some(CursorFingerprint {
+        x: cursor.x,
+        y: cursor.y,
+        width: cursor.width,
+        height: cursor.height,
+        hot_x: cursor.hot_x,
+        hot_y: cursor.hot_y,
+        visible: cursor.show && cursor.glyph_ready,
+        pixels: hash.finish(),
+    })
+}
+
+#[cfg(all(test, feature = "host-window"))]
+mod cursor_tests {
+    use super::*;
+
+    #[test]
+    fn cursor_identity_tracks_motion_visibility_and_every_glyph_pixel() {
+        let mut state = crate::model::DeviceState::new(crate::model::DeviceId(1), 12);
+        state.cursor.show = true;
+        state.cursor.width = 2;
+        state.cursor.height = 2;
+        state.cursor.pixels = vec![1, 2, 3, 4];
+        state.cursor.glyph_ready = true;
+        let original = cursor_fingerprint_from(&state, true);
+        state.cursor.x = 17;
+        assert_ne!(cursor_fingerprint_from(&state, true), original);
+        state.cursor.x = 0;
+        state.cursor.pixels[2] ^= 1;
+        assert_ne!(cursor_fingerprint_from(&state, true), original);
+        state.cursor.pixels[2] ^= 1;
+        state.cursor.show = false;
+        assert_ne!(cursor_fingerprint_from(&state, true), original);
+        assert_eq!(cursor_fingerprint_from(&state, false), None);
+    }
+}
+
+#[cfg(feature = "host-window")]
+fn cursor_snapshot(
+    state: &crate::model::DeviceState,
+) -> Option<crate::host_window::present::CursorOverlay> {
+    let cursor = &state.cursor;
+    if !cursor_overlay_enabled() || !cursor.show || !cursor.glyph_ready || cursor.pixels.is_empty()
+    {
+        return None;
+    }
+    Some(crate::host_window::present::CursorOverlay {
+        x: cursor.x,
+        y: cursor.y,
+        width: cursor.width,
+        height: cursor.height,
+        hot_x: cursor.hot_x,
+        hot_y: cursor.hot_y,
+        pixels: std::sync::Arc::new(cursor.pixels.clone()),
+    })
+}
+
+#[cfg(feature = "host-window")]
+fn republish_cursor(
+    link: &mut WindowLink,
+    cursor: Option<crate::host_window::present::CursorOverlay>,
+) {
+    let Ok(mut slot) = link.frames.lock() else {
+        return;
+    };
+    let Some(previous) = slot.as_ref() else {
+        return;
+    };
+    link.seq = link.seq.wrapping_add(1);
+    *slot = Some(std::sync::Arc::new(crate::host_window::present::Frame {
+        seq: link.seq,
+        width: previous.width,
+        height: previous.height,
+        bgra: previous.bgra.clone(),
+        resident: previous.resident.clone(),
+        cursor,
+    }));
+    drop(slot);
+    link.wake.wake();
+}
+
 /// Stop the host-owned window during VM teardown. Sets the stop flag so the
 /// event loop exits, then waits for its Vulkan objects to tear down before QEMU
 /// proceeds to process/driver teardown. Linux joins the dedicated window thread;
@@ -418,40 +583,42 @@ pub fn device_window_stop(id: u64) -> bool {
     let Some(slot) = device_slot(id) else {
         return false;
     };
-    let link = slot.window.lock().take();
-    let Some(mut link) = link else {
+    let links = std::mem::take(&mut *slot.window.lock());
+    if links.is_empty() {
         return true; // no window (or already stopped)
-    };
-    link.stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    #[cfg(target_os = "macos")]
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !link.exited.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-        if !link.exited.load(Ordering::Acquire) {
-            crate::observe::fail(format!(
-                "host_window_stop FAIL reason=main_thread_teardown_timeout id={id}"
-            ));
-            return false;
-        }
     }
-    if let Some(thread) = link.thread.take() {
-        // The window thread's `WindowError` return was discarded here, so a
-        // `build_event_loop`/`run_app` failure on the Linux spawn path vanished
-        // with no line. Emit the typed decline instead. (macOS never takes this
-        // branch — its window runs on the process main thread, so `thread` is
-        // None; the join runs only on the Linux `spawn` path.)
-        match thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                crate::observe::Emit::decline("host_window_run", &error)
-                    .field("id", id)
-                    .fail();
+    for (_, mut link) in links {
+        link.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(target_os = "macos")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !link.exited.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            // A panic in the window thread; the default panic hook already wrote
-            // its message to stderr, and there is no guest command to decline.
-            Err(_) => {}
+            if !link.exited.load(Ordering::Acquire) {
+                crate::observe::fail(format!(
+                    "host_window_stop FAIL reason=main_thread_teardown_timeout id={id}"
+                ));
+                return false;
+            }
+        }
+        if let Some(thread) = link.thread.take() {
+            // The window thread's `WindowError` return was discarded here, so a
+            // `build_event_loop`/`run_app` failure on the Linux spawn path vanished
+            // with no line. Emit the typed decline instead. (macOS never takes this
+            // branch — its window runs on the process main thread, so `thread` is
+            // None; the join runs only on the Linux `spawn` path.)
+            match thread.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    crate::observe::Emit::decline("host_window_run", &error)
+                        .field("id", id)
+                        .fail();
+                }
+                // A panic in the window thread; the default panic hook already wrote
+                // its message to stderr, and there is no guest command to decline.
+                Err(_) => {}
+            }
         }
     }
     true
@@ -519,7 +686,7 @@ pub(crate) fn publish_window_early_frame<
     now_ns: u64,
 ) {
     let mut guard = slot.window.lock();
-    let Some(link) = guard.as_mut() else {
+    let Some(link) = guard.get_mut(&0) else {
         return;
     };
     // Console-ownership gate (mirror of host_console_uses_bar1): only feed the
@@ -553,7 +720,7 @@ pub(crate) fn publish_window_early_frame<
     slot.early_last_ns.store(now_ns, Ordering::Relaxed);
     // Early boot frames come from the BAR1 GOP framebuffer, not a resident
     // target, so there is no resident source to hand over.
-    window_write_frame(link, w, h, buf, None);
+    window_write_frame(link, w, h, buf, None, None);
 }
 
 /// Copy the registered BAR1 early framebuffer into `dst` (tight BGRA8). Returns

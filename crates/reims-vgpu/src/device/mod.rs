@@ -116,21 +116,21 @@ struct BoundDevice {
     /// owns `inner`) still pulse VBL so the guest keeps its display time base
     /// under load — without it, `device_poll` early-returns on the `try_lock`
     /// miss and drops the VBL entirely (kb present-thrash-proxies: VBL collapses
-    /// to ~7 Hz under interaction). `vbl_shared_gpa == 0` ⇒ not online yet.
-    vbl_shared_gpa: AtomicU64,
-    vbl_display_index: AtomicU32,
-    vbl_online: AtomicBool,
-    /// Wall-clock ms of the last VBL claimed by either the locked or contended
-    /// poll path. One shared limiter keeps guest pacing independent of which
-    /// path happens to win the device lock.
-    vbl_last_us: AtomicU64,
+    /// to ~7 Hz under interaction). A zero shared GPA means that output is not
+    /// online yet. Each advertised output has its own snapshot and cadence:
+    /// one blocked window must not suppress VBL delivery to another display.
+    vbl_shared_gpas: [AtomicU64; crate::model::MAX_DISPLAY_PORT_COUNT as usize],
+    vbl_online: [AtomicBool; crate::model::MAX_DISPLAY_PORT_COUNT as usize],
+    /// Wall-clock microseconds of the last VBL claimed by either the locked or
+    /// contended poll path, independently for every display pipe.
+    vbl_last_us: [AtomicU64; crate::model::MAX_DISPLAY_PORT_COUNT as usize],
     /// QEMU HostOps (GPA / clock / schedule worker). None in pure unit tests.
     ops: Option<ReimsVgpuHostOps>,
     /// Host-owned presentation window ([[host-window]]), once
     /// `device_window_start` has spawned it. `None` on a normal QEMU-display
     /// boot (the window is opt-in behind `REIMS_VGPU_WINDOW`).
     #[cfg(feature = "host-window")]
-    window: Mutex<Option<window_publish::WindowLink>>,
+    window: Mutex<std::collections::BTreeMap<u32, window_publish::WindowLink>>,
     /// Early-boot framebuffer (BAR1 GOP) registered by the C shim, shown in the
     /// window until the product present path latches.
     #[cfg(feature = "host-window")]
@@ -223,7 +223,17 @@ fn make_backend() -> SelectedBackend {
 ///
 /// `page_shift` must be [`crate::model::PAGE_SHIFT_X86`] (12) or [`crate::model::PAGE_SHIFT_ARM64E`] (14).
 /// There is no default (including no `0` → arm); unsupported values return `None`.
+#[cfg(test)]
 pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u64> {
+    device_create_with_display_ports(ops, page_shift, crate::model::DEFAULT_DISPLAY_PORT_COUNT)
+}
+
+/// Create a device with an explicit guest-visible display-port count.
+pub fn device_create_with_display_ports(
+    ops: Option<ReimsVgpuHostOps>,
+    page_shift: u32,
+    display_port_count: u32,
+) -> Option<u64> {
     use crate::model::{PAGE_SHIFT_ARM64E, PAGE_SHIFT_X86};
     if page_shift != PAGE_SHIFT_ARM64E && page_shift != PAGE_SHIFT_X86 {
         return None;
@@ -233,7 +243,8 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
     *id_guard = id.saturating_add(1);
     drop(id_guard);
     let backend = make_backend();
-    let dev = Device::new(DeviceId(id), backend, page_shift);
+    let dev =
+        Device::new_with_display_ports(DeviceId(id), backend, page_shift, display_port_count)?;
     let intr_disp = Arc::clone(&dev.state.gfx.interrupt_status_disp);
     let intr_gpu = Arc::clone(&dev.state.gfx.interrupt_status_gpu);
     let child_doorbell_rung = Arc::clone(&dev.state.gfx.child_doorbell_rung);
@@ -258,13 +269,12 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             present_action_pending: AtomicBool::new(false),
             present_boundary_seen: AtomicBool::new(false),
             reset_count: AtomicU64::new(0),
-            vbl_shared_gpa: AtomicU64::new(0),
-            vbl_display_index: AtomicU32::new(0),
-            vbl_online: AtomicBool::new(false),
-            vbl_last_us: AtomicU64::new(0),
+            vbl_shared_gpas: std::array::from_fn(|_| AtomicU64::new(0)),
+            vbl_online: std::array::from_fn(|_| AtomicBool::new(false)),
+            vbl_last_us: std::array::from_fn(|_| AtomicU64::new(0)),
             ops,
             #[cfg(feature = "host-window")]
-            window: Mutex::new(None),
+            window: Mutex::new(std::collections::BTreeMap::new()),
             #[cfg(feature = "host-window")]
             early_fb: Mutex::new(None),
             #[cfg(feature = "host-window")]
@@ -536,7 +546,7 @@ pub fn device_drain(id: u64) -> bool {
     // (see `enqueue_present_scanout` / the drain tail below).
     #[cfg(feature = "host-window")]
     {
-        device.state.present.window_active = slot.window.lock().is_some();
+        device.state.present.window_active = !slot.window.lock().is_empty();
     }
     #[cfg(not(feature = "host-window"))]
     {
@@ -557,6 +567,17 @@ pub fn device_drain(id: u64) -> bool {
     let publish_started = std::time::Instant::now();
     // Push the finished present frame to the host-owned window (if running).
     // Off the QEMU main loop; a small dedicated mutex, never the render lock.
+    #[cfg(feature = "host-window")]
+    if device.state.present.window_active
+        && crate::env::switch(crate::env::CURSOR_OVERLAY) == crate::env::Switch::On
+    {
+        let display_index = device.state.present_display_index;
+        crate::runtime::drain::sample_cursor_position_for_display(
+            &mut device.state,
+            &host,
+            display_index,
+        );
+    }
     #[cfg(feature = "host-window")]
     window_publish::publish_window_frame(&slot, &mut device.state);
     crate::runtime::drain::note_drain_tranche(
@@ -640,12 +661,15 @@ pub fn device_poll(id: u64) -> bool {
     // Republish the lock-free VBL snapshot for the contended fast path above.
     // These change only at online-ack/reinit, but publishing every poll keeps
     // the snapshot fresh with no extra synchronization on the rare-change path.
-    slot.vbl_shared_gpa
-        .store(device.state.display.shared_gpa, Ordering::Release);
-    slot.vbl_display_index
-        .store(device.state.display.display_index, Ordering::Release);
-    slot.vbl_online
-        .store(device.state.display.online_acked, Ordering::Release);
+    for index in 0..crate::model::MAX_DISPLAY_PORT_COUNT as usize {
+        let display = device.state.display_pipe(index as u32);
+        slot.vbl_shared_gpas[index]
+            .store(display.map_or(0, |pipe| pipe.shared_gpa), Ordering::Release);
+        slot.vbl_online[index].store(
+            display.is_some_and(|pipe| pipe.online_acked),
+            Ordering::Release,
+        );
+    }
     // Census both source polls and the independently time-gated VBL rate.
     // Drive the resident idle-drain off the poll heartbeat, which ticks even when
     // the guest stops compositing (a static page means no publishes at all).
@@ -697,50 +721,46 @@ pub fn device_poll(id: u64) -> bool {
 /// than dropping ~90% of VBLs, which is the pre-fix behaviour under load.
 fn vbl_contended_pulse(slot: &BoundDevice) {
     use crate::runtime::host::HostMemory;
-    let gpa = slot.vbl_shared_gpa.load(Ordering::Acquire);
     let now = crate::observe::elapsed_ms() as u64;
-    if gpa == 0 || !slot.vbl_online.load(Ordering::Acquire) {
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_ONLINE, now);
-        return;
-    }
     let Some(ops) = slot.ops else {
         return;
     };
-    // Both poll paths share one limiter, so both have to report into one census
-    // or the delivered rate reads low by whatever share of polls found the
-    // device lock contended.
-    if !crate::runtime::drain::claim_display_vbl(&slot.vbl_last_us, crate::observe::elapsed_us()) {
-        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_CLAIMED, now);
-        return;
-    }
-    crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_DELIVERED, now);
     let mut scratch = VecDeque::new();
     let mut host = QemuHost::new(&ops, &mut scratch, &slot.prompt_actions);
-    let mut buf = [0u8; 4];
-    if host
-        .read_gpa(gpa + crate::model::DISPLAY_SHARED_PENDING, &mut buf)
-        .is_err()
-    {
-        return;
+    let now_us = crate::observe::elapsed_us();
+    for index in 0..crate::model::MAX_DISPLAY_PORT_COUNT as usize {
+        let gpa = slot.vbl_shared_gpas[index].load(Ordering::Acquire);
+        if gpa == 0 || !slot.vbl_online[index].load(Ordering::Acquire) {
+            continue;
+        }
+        if !crate::runtime::drain::claim_display_vbl(&slot.vbl_last_us[index], now_us) {
+            crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_NOT_CLAIMED, now);
+            continue;
+        }
+        crate::runtime::drain::note_vbl(crate::runtime::drain::VBL_DELIVERED, now);
+        let mut buf = [0u8; 4];
+        if host
+            .read_gpa(gpa + crate::model::DISPLAY_SHARED_PENDING, &mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        let pending = u32::from_le_bytes(buf);
+        let next = (pending & !crate::model::DISPLAY_ONLINE_EVENT_MASK)
+            | crate::model::DISPLAY_VBL_EVENT_MASK;
+        if host
+            .write_gpa(
+                gpa + crate::model::DISPLAY_SHARED_PENDING,
+                &next.to_le_bytes(),
+            )
+            .is_err()
+        {
+            continue;
+        }
+        slot.intr_disp
+            .fetch_or(1u32 << (index & 0x1f), Ordering::AcqRel);
+        host.enqueue(HostAction::irq_gfx());
     }
-    // ONLINE is acked here (vbl_online), so a lingering bit2 is stale — drop it
-    // (mirrors signal_display_vbl's post-ack masking) and OR in the VBL bit.
-    let pending = u32::from_le_bytes(buf);
-    let next =
-        (pending & !crate::model::DISPLAY_ONLINE_EVENT_MASK) | crate::model::DISPLAY_VBL_EVENT_MASK;
-    if host
-        .write_gpa(
-            gpa + crate::model::DISPLAY_SHARED_PENDING,
-            &next.to_le_bytes(),
-        )
-        .is_err()
-    {
-        return;
-    }
-    let idx = slot.vbl_display_index.load(Ordering::Acquire);
-    slot.intr_disp
-        .fetch_or(1u32 << (idx & 0x1f), Ordering::AcqRel);
-    host.enqueue(HostAction::irq_gfx());
 }
 
 /// Pop one HostAction for the QEMU BH. Returns false if the queue is empty.

@@ -174,6 +174,15 @@ mod tests {
         assert_eq!(m.a3, 1080);
     }
 
+    #[test]
+    fn relative_pointer_motion_preserves_signed_deltas() {
+        let action = HostAction::input_pointer_relative(-37, 19);
+        assert_eq!(action.kind, HostActionKind::InputPointerRelative);
+        assert_eq!(action.a0 as i64, -37);
+        assert_eq!(action.a1 as i64, 19);
+        assert_eq!((action.a2, action.a3), (0, 0));
+    }
+
     /// `InputPointerButton` packs the neutral button code in `a0` and up/down in
     /// `a1`; the code round-trips back to the same `ReimsVgpuButton`.
     #[test]

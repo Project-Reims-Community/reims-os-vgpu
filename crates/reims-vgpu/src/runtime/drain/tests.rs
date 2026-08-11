@@ -56,6 +56,45 @@ fn present_scanout_action_follows_window_active() {
     );
 }
 
+/// Each nested output must sample its own shared-state page. Reusing Display0's
+/// page is the cursor analogue of routing both windows' input to the primary.
+#[test]
+fn cursor_position_sampling_selects_the_presented_display_page() {
+    use crate::runtime::host::{FakeHost, HostMemory};
+
+    let mut state =
+        DeviceState::new_with_display_ports(crate::model::DeviceId(1), PAGE_SHIFT_X86, 2)
+            .expect("two displays are guest-supported");
+    let mut host = FakeHost::new();
+    state.display.display_index = 0;
+    state.display.shared_gpa = 0x10_000;
+    state.additional_displays.insert(
+        1,
+        crate::model::DisplayHandshake {
+            display_index: 1,
+            shared_gpa: 0x20_000,
+            ..Default::default()
+        },
+    );
+    host.write_gpa(
+        state.display.shared_gpa + DISPLAY_SHARED_CURSOR_POS,
+        &(11u32 | (22u32 << 16)).to_le_bytes(),
+    )
+    .unwrap();
+    host.write_gpa(
+        0x20_000 + DISPLAY_SHARED_CURSOR_POS,
+        &(333u32 | (444u32 << 16)).to_le_bytes(),
+    )
+    .unwrap();
+    host.write_gpa(0x20_000 + DISPLAY_SHARED_CURSOR_SHOW, &1u32.to_le_bytes())
+        .unwrap();
+
+    sample_cursor_position_for_display(&mut state, &host, 1);
+
+    assert_eq!((state.cursor.x, state.cursor.y), (333, 444));
+    assert!(state.cursor.show);
+}
+
 /// The mapping the host window will show for the present just accepted.
 ///
 /// These tests used to observe the present through the `ScanoutUpdate`
@@ -782,7 +821,12 @@ fn composite_named_present_captures_the_named_member_however_far_it_lags() {
     state.present.height = h;
 
     let present_named = |state: &mut DeviceState, host: &mut FakeHost, mid: u32| {
-        process_child_packet(state, host, 5, &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid));
+        process_child_packet(
+            state,
+            host,
+            5,
+            &present_packet(CHILD_OP_DISPLAY_TRANSACTION2, mid),
+        );
     };
 
     // Healthy alternation: both members publish, the named member is captured.
@@ -832,11 +876,11 @@ fn present_holds_for_translation_deferred_on_other_channel() {
     state.translation_deferred_mask = 1 << 1;
 
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, 2),
+        present_named_mapping(&mut state, &mut host, 5, 0, 2),
         ChildPacketDisposition::Deferred
     );
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, 2),
+        present_named_mapping(&mut state, &mut host, 5, 0, 2),
         ChildPacketDisposition::Deferred
     );
 
@@ -847,7 +891,7 @@ fn present_holds_for_translation_deferred_on_other_channel() {
 
     state.translation_deferred_mask = 0;
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, 2),
+        present_named_mapping(&mut state, &mut host, 5, 0, 2),
         ChildPacketDisposition::Complete
     );
     assert_eq!(state.present_translation_hold_mask, 0);
@@ -864,7 +908,7 @@ fn present_does_not_hold_for_current_channel_translation_bit() {
     state.translation_deferred_mask = 1 << 5;
 
     assert_eq!(
-        present_named_mapping(&mut state, &mut host, 5, 2),
+        present_named_mapping(&mut state, &mut host, 5, 0, 2),
         ChildPacketDisposition::Complete
     );
 
@@ -1195,7 +1239,7 @@ fn display_swap_signals_present_complete_on_shared_page() {
         .store(0, std::sync::atomic::Ordering::Release);
     host.put_u32(shared + DISPLAY_SHARED_ENABLE_MASK, 0);
     host.put_u32(shared + DISPLAY_SHARED_PENDING, 0);
-    signal_display_present_complete(&mut state, &mut host);
+    signal_display_present_complete(&mut state, &mut host, 0);
     assert!(host
         .read_gpa(shared + DISPLAY_SHARED_PENDING, &mut le)
         .is_ok());
@@ -1360,6 +1404,25 @@ fn drain_other_child_fifos_is_a_safe_noop_without_rings() {
         state.pending.child_mask, 0,
         "the sibling drain consumes the pending mask"
     );
+}
+
+#[test]
+fn a_present_waits_for_an_already_accepted_other_output_frame() {
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_ARM64E, 2)
+        .expect("two display ports are supported");
+    let mut host = FakeHost::new();
+    state.pending.host_action_yield = true;
+    state.present_display_index = 1;
+
+    assert_eq!(
+        present_named_mapping(&mut state, &mut host, 5, 0, 7),
+        ChildPacketDisposition::Deferred
+    );
+    assert_eq!(
+        state.present_display_index, 1,
+        "the frame awaiting publication keeps ownership of the shared capture workspace"
+    );
+    assert_eq!(state.present.present_mapping, 0);
 }
 
 #[test]
@@ -1827,6 +1890,45 @@ fn display_online_waits_for_enable_mask_then_signals() {
     state.display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
     try_display_online(&mut state, &mut host);
     assert!(host.actions.is_empty());
+}
+
+#[test]
+fn display_online_signals_each_registered_pipe_independently() {
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_ARM64E, 2)
+        .expect("two display ports are supported");
+    let mut host = FakeHost::new();
+    let gpas = [0x7b000000u64, 0x7b004000u64];
+
+    for (index, gpa) in gpas.into_iter().enumerate() {
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        let display = state
+            .display_pipe_mut(index as u32)
+            .expect("advertised display has handshake state");
+        display.shared_gpa = gpa;
+        display.display_index = index as u32;
+        display.poll_ctr = DISPLAY_ONLINE_POLL_DIVISOR - 1;
+
+        let mut enable = [0u8; 4];
+        st32(&mut enable, DISPLAY_ONLINE_EVENT_MASK);
+        host.write_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &enable)
+            .unwrap();
+    }
+
+    try_display_online(&mut state, &mut host);
+
+    assert_eq!(host.actions.len(), 2);
+    assert!(host
+        .actions
+        .iter()
+        .all(|action| action.kind == HostActionKind::IrqGfxPulse));
+    for (index, gpa) in gpas.into_iter().enumerate() {
+        let display = state.display_pipe(index as u32).unwrap();
+        assert_eq!(display.online_tries, 1);
+        let mut pending = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+            .unwrap();
+        assert_eq!(ld32(&pending), DISPLAY_ONLINE_EVENT_MASK);
+    }
 }
 
 /// Display-lifecycle instrumentation: SETUP_SHARED_STATE, ONLINE ack, and the
@@ -2905,6 +3007,44 @@ fn signal_display_vbl_after_online_uses_shared_time_limiter() {
     );
 }
 
+#[test]
+fn display_vbl_has_an_independent_limiter_for_each_pipe() {
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_ARM64E, 2)
+        .expect("two display ports are supported");
+    let mut host = FakeHost::new();
+    let gpas = [0x7c000000u64, 0x7c004000u64];
+    for (index, gpa) in gpas.into_iter().enumerate() {
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        let display = state.display_pipe_mut(index as u32).unwrap();
+        display.shared_gpa = gpa;
+        display.display_index = index as u32;
+        display.online_acked = true;
+    }
+    let limiters: [std::sync::atomic::AtomicU64; MAX_DISPLAY_PORT_COUNT as usize] =
+        std::array::from_fn(|_| std::sync::atomic::AtomicU64::new(0));
+
+    signal_display_vbl_all_at(&mut state, &mut host, &limiters, 5_000_000);
+
+    assert_eq!(host.actions.len(), 2);
+    assert_eq!(
+        state
+            .gfx
+            .interrupt_status_disp
+            .load(std::sync::atomic::Ordering::Acquire)
+            & 0b11,
+        0b11
+    );
+    for gpa in gpas {
+        let mut pending = [0u8; 4];
+        host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
+            .unwrap();
+        assert_ne!(ld32(&pending) & DISPLAY_VBL_EVENT_MASK, 0);
+    }
+
+    assert!(!claim_display_vbl(&limiters[0], 5_000_000));
+    assert!(!claim_display_vbl(&limiters[1], 5_000_000));
+}
+
 /// The VBL limiter is phase-locked to a fixed interval grid so poll jitter
 /// cannot alias the delivered rate down to ~60 Hz (the boot-to-boot fps split).
 /// The VBL we deliver must be the refresh rate we advertise.
@@ -3028,7 +3168,7 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
     // Stale ONLINE bit left in pending (the try_display_online/ack race).
     host.put_u32(gpa + DISPLAY_SHARED_PENDING, DISPLAY_ONLINE_EVENT_MASK);
 
-    signal_display_present_complete(&mut state, &mut host);
+    signal_display_present_complete(&mut state, &mut host, 0);
 
     let mut pending = [0u8; 4];
     host.read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending)
@@ -3048,6 +3188,38 @@ fn acked_stale_online_bit_is_suppressed_not_redelivered() {
         logged(),
         before + 1,
         "the suppressed stale online must still be named on the always-on log"
+    );
+}
+
+#[test]
+fn present_completion_targets_the_named_display_pipe() {
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_ARM64E, 2)
+        .expect("two display ports are supported");
+    let mut host = FakeHost::new();
+    let primary_gpa = 0x7d00_0000u64;
+    let secondary_gpa = 0x7d00_4000u64;
+    for (index, gpa) in [primary_gpa, secondary_gpa].into_iter().enumerate() {
+        host.map_range(gpa, PAGE_SIZE_ARM64E as usize, 0);
+        host.put_u32(gpa + DISPLAY_SHARED_ENABLE_MASK, DISPLAY_PRESENT_EVENT_MASK);
+        let display = state.display_pipe_mut(index as u32).unwrap();
+        display.shared_gpa = gpa;
+        display.display_index = index as u32;
+        display.online_acked = true;
+    }
+
+    signal_display_present_complete(&mut state, &mut host, 1);
+
+    assert_eq!(host.get_u32(primary_gpa + DISPLAY_SHARED_PENDING), 0);
+    assert_eq!(
+        host.get_u32(secondary_gpa + DISPLAY_SHARED_PENDING),
+        DISPLAY_PRESENT_EVENT_MASK
+    );
+    assert_eq!(
+        state
+            .gfx
+            .interrupt_status_disp
+            .load(std::sync::atomic::Ordering::Acquire),
+        0b10
     );
 }
 
@@ -3753,7 +3925,11 @@ fn the_overlong_alarm_dumps_the_tail_and_explains_the_right_command() {
     // op6 does serialize a transaction, so the plane-list reading is its own
     // and must survive. Same alarm, different explanation.
     let cap = crate::observe::FailCapture::start();
-    note_display_txn_payload(&mut state, 5, &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]));
+    note_display_txn_payload(
+        &mut state,
+        5,
+        &packet(CHILD_OP_DISPLAY_TRANSACTION2, vec![7u8; 64]),
+    );
     let lines = cap.lines();
     let line = lines
         .iter()
@@ -3818,8 +3994,14 @@ fn display_txn_trailer_slots_follow_the_emitting_command() {
     );
     // The present path reads the same field the census does, for every command.
     for (op, off) in [
-        (CHILD_OP_DISPLAY_TRANSACTION2, DISPLAY_TRANSACTION2_SURFACE_ID),
-        (CHILD_OP_DISPLAY_TRANSACTION3, DISPLAY_TRANSACTION3_SURFACE_ID),
+        (
+            CHILD_OP_DISPLAY_TRANSACTION2,
+            DISPLAY_TRANSACTION2_SURFACE_ID,
+        ),
+        (
+            CHILD_OP_DISPLAY_TRANSACTION3,
+            DISPLAY_TRANSACTION3_SURFACE_ID,
+        ),
         (CHILD_OP_DISPLAY_SWAP, DISPLAY_SWAP_MAPPING),
     ] {
         let mut p = vec![0u8; display_txn_trailer_len(op)];
@@ -3899,10 +4081,6 @@ fn a_resident_carried_present_is_unsampled_not_black() {
         PresentContentVerdict::Content
     );
 }
-
-
-
-
 
 /// Root and child `DefineTask2` decode one wire field one way.
 ///
@@ -4260,7 +4438,8 @@ fn every_short_control_packet_names_itself() {
 /// display pipe index.
 #[test]
 fn root_opcode_one_sets_up_the_display_shared_state() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_ARM64E, 3)
+        .expect("three display ports are valid");
     let mut host = FakeHost::new();
 
     // `{u32 pipe index, u32 shared-state page PFN}`.
@@ -4279,9 +4458,10 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
         },
     );
 
-    assert_eq!(state.display.display_index, 2, "the pipe index latched");
+    let display = state.display_pipe(2).expect("pipe 2 registered");
+    assert_eq!(display.display_index, 2, "the pipe index latched");
     assert_eq!(
-        state.display.shared_gpa,
+        display.shared_gpa,
         state.pfn_gpa(0x40),
         "and the shared-state page, from the same payload the child arm reads"
     );
@@ -4297,18 +4477,16 @@ fn root_opcode_one_sets_up_the_display_shared_state() {
 /// The first payload word is this command's own data, and the old arm's reading
 /// of it as an opcode is what this pins shut.
 ///
-/// A pipe index of `ROOT_OP_DELETE_TASK` is an ordinary index — Apple's own
-/// numbering has no reason to avoid it — and under the old arm it deleted a
-/// task instead of registering a display. The task is defined here so the
-/// wrong behaviour would be *visible* rather than a no-op: if this ever
-/// regresses, the task is gone and the display never latched.
+/// Pipe index one is ordinary command data even though one is also the setup
+/// opcode. Dispatching on it again would reinterpret the payload recursively
+/// instead of registering the second display.
 #[test]
 fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
-    let mut state = DeviceState::new(DeviceId(1), PAGE_SHIFT_ARM64E);
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_ARM64E, 2)
+        .expect("two display ports are valid");
     let mut host = FakeHost::new();
-    state.define_task(3, 0x1000, 2);
 
-    let mut payload = u32::from(ROOT_OP_DELETE_TASK).to_le_bytes().to_vec();
+    let mut payload = u32::from(ROOT_OP_SETUP_SHARED_STATE).to_le_bytes().to_vec();
     payload.extend_from_slice(&3u32.to_le_bytes());
     process_root_packet(
         &mut state,
@@ -4323,15 +4501,77 @@ fn a_pipe_index_that_looks_like_an_opcode_is_still_a_pipe_index() {
         },
     );
 
+    let display = state.display_pipe(1).expect("pipe 1 registered");
+    assert_eq!(display.display_index, 1, "the word is a pipe index");
     assert_eq!(
-        state.display.display_index,
-        u32::from(ROOT_OP_DELETE_TASK),
-        "the word is a pipe index and latched as one"
-    );
-    assert_eq!(
-        state.display.shared_gpa,
+        display.shared_gpa,
         state.pfn_gpa(3),
-        "and the second word is the page, not a task id"
+        "and the second word is the page"
+    );
+}
+
+#[test]
+fn two_display_channels_keep_independent_handshakes_and_ack_state() {
+    let mut state = DeviceState::new_with_display_ports(DeviceId(1), PAGE_SHIFT_X86, 2)
+        .expect("two display ports are valid");
+    let mut host = FakeHost::new();
+
+    for (channel, index, pfn) in [(5u32, 0u32, 0x40u32), (6, 1, 0x80)] {
+        let mut payload = index.to_le_bytes().to_vec();
+        payload.extend_from_slice(&pfn.to_le_bytes());
+        assert_eq!(
+            process_child_packet(
+                &mut state,
+                &mut host,
+                channel,
+                &Packet {
+                    opcode: CHILD_OP_SETUP_SHARED_STATE,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN + CHILD_SHARED_STATE_LEN as u32,
+                    completion_stamp: 0,
+                    payload,
+                    next_head: 0,
+                },
+            ),
+            ChildPacketDisposition::Complete
+        );
+    }
+
+    assert_eq!(state.display.shared_gpa, state.pfn_gpa(0x40));
+    assert_eq!(
+        state
+            .display_pipe(1)
+            .expect("secondary registered")
+            .shared_gpa,
+        state.pfn_gpa(0x80)
+    );
+    assert_eq!(state.display_pipe_for_channel(5), Some(0));
+    assert_eq!(state.display_pipe_for_channel(6), Some(1));
+
+    for channel in [5, 6] {
+        assert_eq!(
+            process_child_packet(
+                &mut state,
+                &mut host,
+                channel,
+                &Packet {
+                    opcode: CHILD_OP_ONLINE_ACK,
+                    stamp_waits: Vec::new(),
+                    total_size: PACKET_HEADER_LEN,
+                    completion_stamp: 0,
+                    payload: Vec::new(),
+                    next_head: 0,
+                },
+            ),
+            ChildPacketDisposition::Complete
+        );
+    }
+    assert!(state.display.online_acked);
+    assert!(
+        state
+            .display_pipe(1)
+            .expect("secondary registered")
+            .online_acked
     );
 }
 
@@ -5078,7 +5318,12 @@ fn a_delete_object_counts_the_kind_its_record_names() {
 
     // The one kind this device holds anything by ref for. Its counter reading
     // above zero on a boot is the signal that would justify a handler.
-    process_child_packet(&mut state, &mut host, 4, &destroy_packet(OPCODE_DELETE_FENCE));
+    process_child_packet(
+        &mut state,
+        &mut host,
+        4,
+        &destroy_packet(OPCODE_DELETE_FENCE),
+    );
     assert_eq!(
         store_route_count("child_delete_object_fence"),
         fence_before + 1,
@@ -5158,7 +5403,7 @@ fn the_discarding_commands_share_the_synchronize_record_layout() {
     st32(&mut good[0..], 7); // task
     st32(&mut good[4..], 1); // count
     st32(&mut good[8..], 0x2a); // object id
-    // The same header claiming four records in a packet that holds one.
+                                // The same header claiming four records in a packet that holds one.
     let mut liar = good.clone();
     st32(&mut liar[4..], 4);
 
@@ -5276,18 +5521,8 @@ fn each_map_family_command_takes_its_own_branch() {
     // five neighbours: whether the named mapping's content generation moved, and
     // whether the command reported itself unimplemented.
     for (opcode, payload, bumps_generation, declined) in [
-        (
-            CHILD_OP_INVALIDATE_RESOURCES,
-            &invalidate,
-            true,
-            None,
-        ),
-        (
-            CHILD_OP_SYNCHRONIZE_RESOURCES,
-            &synchronize,
-            false,
-            None,
-        ),
+        (CHILD_OP_INVALIDATE_RESOURCES, &invalidate, true, None),
+        (CHILD_OP_SYNCHRONIZE_RESOURCES, &synchronize, false, None),
         (
             CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES,
             &synchronize,

@@ -23,7 +23,7 @@ fn main() {
     // The window sleeps until something says a frame landed, so this stands in
     // for the device's publisher — without it the gradient would advance only at
     // the window's backstop rate rather than at the 62 Hz below.
-    let wake = WindowWaker::new();
+    let wake = WindowWaker::new(0);
 
     // Animate the gradient on a helper thread so the window shows live updates.
     let anim = frames.clone();
@@ -47,6 +47,8 @@ fn main() {
     let stop = Arc::new(AtomicBool::new(false));
     let handle = spawn(
         WindowConfig {
+            display_index: 0,
+            display_count: 1,
             title: "reims_vgpu host-window smoke".to_string(),
             width: w,
             height: h,
@@ -84,5 +86,6 @@ fn gradient(w: u32, h: u32, t: u32) -> Frame {
         height: h,
         bgra,
         resident: None,
+        cursor: None,
     }
 }

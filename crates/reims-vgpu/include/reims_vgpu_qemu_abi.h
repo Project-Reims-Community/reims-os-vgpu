@@ -21,7 +21,10 @@
 extern "C" {
 #endif
 
-/* v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
+/* v19: ReimsVgpuQemuCreateInfo.display_port_count — the guest-visible Apple
+ *      display-pipe count, explicitly configured by the QEMU device and
+ *      validated by Rust against the guest driver's 1..=8 contract.
+ * v18: ReimsVgpuHostOps.dmabuf_for_pages and every REIMS_VGPU_DMABUF_* removed.
  *      v17's spans replaced the mechanism outright: guest pages reach the host
  *      GPU by importing the RAMBlock mapping QEMU already holds, on Linux,
  *      Windows and macOS alike, rather than through a Linux-only udmabuf fd.
@@ -91,13 +94,16 @@ extern "C" {
  *     thread so IRQ pulses reach the guest mid-drain — ack fast).
  * v6: ReimsVgpuHostOps.is_ram_gpa (reject non-RAM PFNs on mapper / map_pages paths).
  * v5: ReimsVgpuQemuCreateInfo.guest_page_shift (12 = x86 Tahoe, 14 = arm64e). */
-#define REIMS_VGPU_QEMU_ABI_VERSION 18u
+#define REIMS_VGPU_QEMU_ABI_VERSION 19u
 
 #define REIMS_VGPU_QEMU_OK 0
 #define REIMS_VGPU_QEMU_ERR_ARGS 1
 #define REIMS_VGPU_QEMU_ERR_STATE 2
 #define REIMS_VGPU_QEMU_ERR_PANIC 3
 #define REIMS_VGPU_QEMU_EMPTY 4
+
+/* Rust model::DEFAULT_DISPLAY_PORT_COUNT owns the one-display compatibility default. */
+#define REIMS_VGPU_DISPLAY_PORT_COUNT_DEFAULT 1u
 
 /*
  * Why guest_ram_regions refused, when it did. Negative so one return value
@@ -217,6 +223,8 @@ typedef struct ReimsVgpuGuestRamRegion {
  * closing it closes the machine.
  */
 #define REIMS_VGPU_HOST_ACTION_WINDOW_CLOSED 11u
+/* Signed relative dx/dy in a0/a1, consumed by an emulated usb-mouse. */
+#define REIMS_VGPU_HOST_ACTION_INPUT_POINTER_RELATIVE 12u
 
 /* Neutral pointer/wheel button codes (ReimsVgpuButton) carried in INPUT_POINTER_BUTTON
  * a0. Stable wire contract owned by Rust; the shim maps to QEMU InputButton. */
@@ -393,6 +401,8 @@ typedef struct ReimsVgpuQemuCreateInfo {
      * 0 is invalid (no default).
      */
     uint32_t guest_page_shift;
+    /* Apple display-pipe count. Required and bounded to 1..=8 by Rust. */
+    uint32_t display_port_count;
 } ReimsVgpuQemuCreateInfo;
 
 typedef struct ReimsVgpuQemuDevice {

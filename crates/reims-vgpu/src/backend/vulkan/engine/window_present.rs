@@ -47,11 +47,10 @@ const fn guest_frame_budget_ns(refresh_hz: u32) -> Option<u64> {
     }
 }
 
-const ACQUIRE_RETRY_BUDGET_NS: u64 =
-    match guest_frame_budget_ns(crate::model::DISPLAY_REFRESH_HZ) {
-        Some(timeout) => timeout,
-        None => 0,
-    };
+const ACQUIRE_RETRY_BUDGET_NS: u64 = match guest_frame_budget_ns(crate::model::DISPLAY_REFRESH_HZ) {
+    Some(timeout) => timeout,
+    None => 0,
+};
 const _: () = assert!(ACQUIRE_RETRY_BUDGET_NS > 0);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -579,6 +578,11 @@ pub(crate) struct WindowPresenter {
     /// this is not a measurement of time spent asleep.
     cadence_acquire_retried: u64,
     cadence_acquire_rescued: u64,
+    cursor_enabled: bool,
+    color_format: vk::Format,
+    image_views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    cursor_gpu: Option<CursorGpu>,
 }
 
 impl WindowPresenter {
@@ -708,6 +712,12 @@ impl WindowPresenter {
             cadence_busy_acquire: 0,
             cadence_acquire_retried: 0,
             cadence_acquire_rescued: 0,
+            cursor_enabled: crate::env::switch(crate::env::CURSOR_OVERLAY)
+                == crate::env::Switch::On,
+            color_format: vk::Format::UNDEFINED,
+            image_views: Vec::new(),
+            framebuffers: Vec::new(),
+            cursor_gpu: None,
         };
         if let Err(error) = presenter.recreate_swapchain(ctx) {
             presenter.destroy(ctx, None);
@@ -726,6 +736,49 @@ impl WindowPresenter {
             self.recreate_reason = "resize";
         }
         self.desired_extent = requested;
+    }
+
+    unsafe fn destroy_overlay_targets(&mut self, ctx: &DeviceContext) {
+        for framebuffer in self.framebuffers.drain(..) {
+            ctx.device.destroy_framebuffer(framebuffer, None);
+        }
+        for view in self.image_views.drain(..) {
+            ctx.device.destroy_image_view(view, None);
+        }
+    }
+
+    unsafe fn build_overlay_targets(&mut self, ctx: &DeviceContext) -> Result<(), vk::Result> {
+        let Some(gpu) = self.cursor_gpu.as_ref() else {
+            return Ok(());
+        };
+        for &image in &self.images {
+            let view = ctx.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(self.color_format)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    ),
+                None,
+            )?;
+            let attachments = [view];
+            let framebuffer = ctx.device.create_framebuffer(
+                &vk::FramebufferCreateInfo::default()
+                    .render_pass(gpu.render_pass)
+                    .attachments(&attachments)
+                    .width(self.extent.width)
+                    .height(self.extent.height)
+                    .layers(1),
+                None,
+            )?;
+            self.image_views.push(view);
+            self.framebuffers.push(framebuffer);
+        }
+        Ok(())
     }
 
     unsafe fn retire(
@@ -766,6 +819,21 @@ impl WindowPresenter {
                 super::reason::DrawReason::SwapchainLacksTransferDst,
             ));
         }
+        let mut image_usage = vk::ImageUsageFlags::TRANSFER_DST;
+        if self.cursor_enabled {
+            if caps
+                .supported_usage_flags
+                .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            {
+                image_usage |= vk::ImageUsageFlags::COLOR_ATTACHMENT;
+            } else {
+                crate::observe::off(
+                    "host_window_cursor status=disabled reason=no_color_attachment_usage",
+                );
+                self.cursor_enabled = false;
+            }
+        }
+        self.destroy_overlay_targets(ctx);
         let formats = self
             .surface_loader
             .get_physical_device_surface_formats(ctx.pd, self.surface)
@@ -864,7 +932,7 @@ impl WindowPresenter {
                     .image_color_space(format.color_space)
                     .image_extent(extent)
                     .image_array_layers(1)
-                    .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+                    .image_usage(image_usage)
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(caps.current_transform)
                     .composite_alpha(composite_alpha)
@@ -929,6 +997,32 @@ impl WindowPresenter {
         self.extent = extent;
         self.desired_extent = extent;
         self.recreate_pending = false;
+        self.color_format = format.format;
+        if self.cursor_enabled {
+            if self.cursor_gpu.as_ref().map(|gpu| gpu.color_format) != Some(format.format) {
+                if let Some(gpu) = self.cursor_gpu.take() {
+                    gpu.destroy(&ctx.device);
+                }
+                match CursorGpu::new(ctx, format.format) {
+                    Ok(gpu) => self.cursor_gpu = Some(gpu),
+                    Err(error) => {
+                        crate::observe::off(format!(
+                            "host_window_cursor status=disabled reason=create_failed vk={error:?}"
+                        ));
+                        self.cursor_enabled = false;
+                    }
+                }
+            }
+            if self.cursor_enabled {
+                if let Err(error) = self.build_overlay_targets(ctx) {
+                    crate::observe::off(format!(
+                        "host_window_cursor status=disabled reason=targets_failed vk={error:?}"
+                    ));
+                    self.destroy_overlay_targets(ctx);
+                    self.cursor_enabled = false;
+                }
+            }
+        }
         if extent != from {
             // A geometry change is progress; only a same-extent suboptimal
             // loop should keep accumulating toward the alarm.
@@ -951,6 +1045,7 @@ impl WindowPresenter {
         counters: &EngineCounters,
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
+        cursor: Option<&crate::host_window::present::CursorOverlay>,
     ) -> Result<WindowPresentOutcome, DrawError> {
         if let Some(seq) = cpu.map(|frame| frame.seq) {
             if self.cadence_last_offered != Some(seq) {
@@ -1103,6 +1198,7 @@ impl WindowPresenter {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::TRANSFER,
             );
+            let mut cursor_draw = None;
             if let Some(blit) = blit {
                 let (base_width, base_height) = blit.extent();
                 // Aspect-fit placement: the guest frame keeps its aspect ratio
@@ -1138,10 +1234,26 @@ impl WindowPresenter {
                     (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
                 );
                 if let Some((identity, _, _, _, _)) = selected.as_ref() {
-                    pools.registry_note_access(
-                        identity,
-                        super::pools::ResidentAccess::TransferRead,
-                    );
+                    pools
+                        .registry_note_access(identity, super::pools::ResidentAccess::TransferRead);
+                }
+                if self.cursor_enabled
+                    && self.cursor_gpu.is_some()
+                    && (image_index as usize) < self.framebuffers.len()
+                {
+                    if let Some(overlay) = cursor {
+                        let sx = vp.width as f32 / base_width.max(1) as f32;
+                        let sy = vp.height as f32 / base_height.max(1) as f32;
+                        cursor_draw = Some((
+                            (
+                                vp.x as f32 + (overlay.x as f32 - overlay.hot_x as f32) * sx,
+                                vp.y as f32 + (overlay.y as f32 - overlay.hot_y as f32) * sy,
+                                overlay.width as f32 * sx,
+                                overlay.height as f32 * sy,
+                            ),
+                            (overlay.width as u32, overlay.height as u32),
+                        ));
+                    }
                 }
             } else {
                 ctx.device.cmd_clear_color_image(
@@ -1154,17 +1266,42 @@ impl WindowPresenter {
                     &[color_range],
                 );
             }
-            image_barrier(
-                &ctx.device,
-                self.cmd,
-                dst,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::empty(),
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            );
+            if let Some((dst_rect, tex_wh)) = cursor_draw {
+                image_barrier(
+                    &ctx.device,
+                    self.cmd,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                );
+                let overlay = cursor.expect("cursor draw requires a cursor snapshot");
+                let framebuffer = self.framebuffers[image_index as usize];
+                let gpu = self.cursor_gpu.as_mut().expect("cursor GPU is enabled");
+                gpu.upload(
+                    ctx,
+                    self.cmd,
+                    overlay.pixels.as_slice(),
+                    overlay.width as u32,
+                    overlay.height as u32,
+                );
+                gpu.record(ctx, self.cmd, framebuffer, self.extent, dst_rect, tex_wh);
+            } else {
+                image_barrier(
+                    &ctx.device,
+                    self.cmd,
+                    dst,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::empty(),
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                );
+            }
             ctx.device.end_command_buffer(self.cmd).map_err(|error| {
                 DrawError::VkCall(VkCall::new(VkOp::WindowEndCommandBuffer, error))
             })?;
@@ -1535,6 +1672,10 @@ impl WindowPresenter {
             self.pinned.clear();
         }
         self.submitted = false;
+        self.destroy_overlay_targets(ctx);
+        if let Some(cursor_gpu) = self.cursor_gpu.take() {
+            cursor_gpu.destroy(&ctx.device);
+        }
         if let Some(staging) = self.staging.take() {
             staging.destroy(&ctx.device);
         }
@@ -1652,6 +1793,417 @@ unsafe fn image_barrier(
             .src_access_mask(src_access)
             .dst_access_mask(dst_access)],
     );
+}
+
+const CURSOR_VERT_SPV: &[u8] = include_bytes!("shaders/cursor_overlay.vert.spv");
+const CURSOR_FRAG_SPV: &[u8] = include_bytes!("shaders/cursor_overlay.frag.spv");
+/// Matches the cursor allocation and the maximum geometry advertised to the
+/// guest in the display descriptor.
+const CURSOR_TEX_DIM: u32 = crate::model::CURSOR_MAX_DIM;
+
+fn spv_words(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_ne_bytes(word.try_into().expect("four-byte SPIR-V word")))
+        .collect()
+}
+
+struct CursorGpu {
+    color_format: vk::Format,
+    render_pass: vk::RenderPass,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+    sampler: vk::Sampler,
+    texture: vk::Image,
+    texture_memory: vk::DeviceMemory,
+    texture_view: vk::ImageView,
+    texture_ready: bool,
+    staging: vk::Buffer,
+    staging_memory: vk::DeviceMemory,
+    staging_ptr: MappedStaging,
+}
+
+impl CursorGpu {
+    unsafe fn new(ctx: &DeviceContext, color_format: vk::Format) -> Result<Self, vk::Result> {
+        let device = &ctx.device;
+        let attachment = [vk::AttachmentDescription::default()
+            .format(color_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::LOAD)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .initial_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+        let color_refs = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+        let subpasses = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_refs)];
+        let dependencies = [vk::SubpassDependency::default()
+            .src_subpass(vk::SUBPASS_EXTERNAL)
+            .dst_subpass(0)
+            .src_stage_mask(vk::PipelineStageFlags::TRANSFER)
+            .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            )];
+        let render_pass = device.create_render_pass(
+            &vk::RenderPassCreateInfo::default()
+                .attachments(&attachment)
+                .subpasses(&subpasses)
+                .dependencies(&dependencies),
+            None,
+        )?;
+
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let set_layout = device.create_descriptor_set_layout(
+            &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+            None,
+        )?;
+        let set_layouts = [set_layout];
+        let push_ranges = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .size(24)];
+        let pipeline_layout = device.create_pipeline_layout(
+            &vk::PipelineLayoutCreateInfo::default()
+                .set_layouts(&set_layouts)
+                .push_constant_ranges(&push_ranges),
+            None,
+        )?;
+        let vertex = device.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&spv_words(CURSOR_VERT_SPV)),
+            None,
+        )?;
+        let fragment = device.create_shader_module(
+            &vk::ShaderModuleCreateInfo::default().code(&spv_words(CURSOR_FRAG_SPV)),
+            None,
+        )?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex)
+                .name(c"main"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment)
+                .name(c"main"),
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_STRIP);
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend =
+            vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let infos = [vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)];
+        let pipeline = device
+            .create_graphics_pipelines(ctx.pipeline_cache, &infos, None)
+            .map_err(|(_, error)| error)?[0];
+        device.destroy_shader_module(vertex, None);
+        device.destroy_shader_module(fragment, None);
+
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)];
+        let descriptor_pool = device.create_descriptor_pool(
+            &vk::DescriptorPoolCreateInfo::default()
+                .max_sets(1)
+                .pool_sizes(&pool_sizes),
+            None,
+        )?;
+        let descriptor_set = device.allocate_descriptor_sets(
+            &vk::DescriptorSetAllocateInfo::default()
+                .descriptor_pool(descriptor_pool)
+                .set_layouts(&set_layouts),
+        )?[0];
+        let sampler = device.create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::NEAREST)
+                .min_filter(vk::Filter::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+            None,
+        )?;
+        let texture = device.create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D {
+                    width: CURSOR_TEX_DIM,
+                    height: CURSOR_TEX_DIM,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST),
+            None,
+        )?;
+        let texture_requirements = device.get_image_memory_requirements(texture);
+        let texture_type = ctx
+            .memory_type_for(
+                texture_requirements.memory_type_bits,
+                crate::backend::vulkan::caps::MemoryClass::DeviceLocal,
+            )
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let texture_memory = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(texture_requirements.size)
+                .memory_type_index(texture_type),
+            None,
+        )?;
+        device.bind_image_memory(texture, texture_memory, 0)?;
+        let texture_view = device.create_image_view(
+            &vk::ImageViewCreateInfo::default()
+                .image(texture)
+                .view_type(vk::ImageViewType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .level_count(1)
+                        .layer_count(1),
+                ),
+            None,
+        )?;
+        let staging_size = u64::from(CURSOR_TEX_DIM * CURSOR_TEX_DIM * 4);
+        let staging = device.create_buffer(
+            &vk::BufferCreateInfo::default()
+                .size(staging_size)
+                .usage(vk::BufferUsageFlags::TRANSFER_SRC),
+            None,
+        )?;
+        let staging_requirements = device.get_buffer_memory_requirements(staging);
+        let staging_type = ctx
+            .memory_type_for(
+                staging_requirements.memory_type_bits,
+                crate::backend::vulkan::caps::MemoryClass::Upload,
+            )
+            .ok_or(vk::Result::ERROR_FEATURE_NOT_PRESENT)?;
+        let staging_memory = device.allocate_memory(
+            &vk::MemoryAllocateInfo::default()
+                .allocation_size(staging_requirements.size)
+                .memory_type_index(staging_type),
+            None,
+        )?;
+        device.bind_buffer_memory(staging, staging_memory, 0)?;
+        let staging_ptr = MappedStaging(device.map_memory(
+            staging_memory,
+            0,
+            staging_requirements.size,
+            vk::MemoryMapFlags::empty(),
+        )? as *mut u8);
+        let image_info = [vk::DescriptorImageInfo::default()
+            .sampler(sampler)
+            .image_view(texture_view)
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        device.update_descriptor_sets(
+            &[vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image_info)],
+            &[],
+        );
+        Ok(Self {
+            color_format,
+            render_pass,
+            set_layout,
+            pipeline_layout,
+            pipeline,
+            descriptor_pool,
+            descriptor_set,
+            sampler,
+            texture,
+            texture_memory,
+            texture_view,
+            texture_ready: false,
+            staging,
+            staging_memory,
+            staging_ptr,
+        })
+    }
+
+    unsafe fn upload(
+        &mut self,
+        ctx: &DeviceContext,
+        cmd: vk::CommandBuffer,
+        pixels: &[u32],
+        width: u32,
+        height: u32,
+    ) {
+        let width = width.min(CURSOR_TEX_DIM);
+        let height = height.min(CURSOR_TEX_DIM);
+        let count = (width * height) as usize;
+        if count == 0 || pixels.len() < count {
+            return;
+        }
+        std::ptr::copy_nonoverlapping(pixels.as_ptr(), self.staging_ptr.0.cast::<u32>(), count);
+        image_barrier(
+            &ctx.device,
+            cmd,
+            self.texture,
+            if self.texture_ready {
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+            } else {
+                vk::ImageLayout::UNDEFINED
+            },
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+            vk::PipelineStageFlags::TRANSFER,
+        );
+        ctx.device.cmd_copy_buffer_to_image(
+            cmd,
+            self.staging,
+            self.texture,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &[vk::BufferImageCopy::default()
+                .buffer_row_length(width)
+                .buffer_image_height(height)
+                .image_subresource(
+                    vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .layer_count(1),
+                )
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })],
+        );
+        image_barrier(
+            &ctx.device,
+            cmd,
+            self.texture,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+        self.texture_ready = true;
+    }
+
+    unsafe fn record(
+        &self,
+        ctx: &DeviceContext,
+        cmd: vk::CommandBuffer,
+        framebuffer: vk::Framebuffer,
+        extent: vk::Extent2D,
+        rect: (f32, f32, f32, f32),
+        texture_extent: (u32, u32),
+    ) {
+        let full = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        ctx.device.cmd_begin_render_pass(
+            cmd,
+            &vk::RenderPassBeginInfo::default()
+                .render_pass(self.render_pass)
+                .framebuffer(framebuffer)
+                .render_area(full),
+            vk::SubpassContents::INLINE,
+        );
+        ctx.device
+            .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.pipeline);
+        ctx.device.cmd_set_viewport(
+            cmd,
+            0,
+            &[vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }],
+        );
+        ctx.device.cmd_set_scissor(cmd, 0, &[full]);
+        ctx.device.cmd_bind_descriptor_sets(
+            cmd,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            0,
+            &[self.descriptor_set],
+            &[],
+        );
+        let width = extent.width as f32;
+        let height = extent.height as f32;
+        let push = [
+            2.0 * rect.0 / width - 1.0,
+            2.0 * rect.1 / height - 1.0,
+            2.0 * (rect.0 + rect.2) / width - 1.0,
+            2.0 * (rect.1 + rect.3) / height - 1.0,
+            texture_extent.0 as f32 / CURSOR_TEX_DIM as f32,
+            texture_extent.1 as f32 / CURSOR_TEX_DIM as f32,
+        ];
+        ctx.device.cmd_push_constants(
+            cmd,
+            self.pipeline_layout,
+            vk::ShaderStageFlags::VERTEX,
+            0,
+            std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), std::mem::size_of_val(&push)),
+        );
+        ctx.device.cmd_draw(cmd, 4, 1, 0, 0);
+        ctx.device.cmd_end_render_pass(cmd);
+    }
+
+    unsafe fn destroy(self, device: &ash::Device) {
+        device.destroy_sampler(self.sampler, None);
+        device.destroy_image_view(self.texture_view, None);
+        device.destroy_image(self.texture, None);
+        device.free_memory(self.texture_memory, None);
+        device.unmap_memory(self.staging_memory);
+        device.destroy_buffer(self.staging, None);
+        device.free_memory(self.staging_memory, None);
+        device.destroy_pipeline(self.pipeline, None);
+        device.destroy_pipeline_layout(self.pipeline_layout, None);
+        device.destroy_descriptor_pool(self.descriptor_pool, None);
+        device.destroy_descriptor_set_layout(self.set_layout, None);
+        device.destroy_render_pass(self.render_pass, None);
+    }
 }
 
 unsafe fn blit_rect(

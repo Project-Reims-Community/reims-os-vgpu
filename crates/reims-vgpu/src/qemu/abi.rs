@@ -19,7 +19,7 @@
 use crate::qemu::host_ops::ReimsVgpuHostOps;
 use crate::runtime::host::HostAction;
 use crate::{
-    backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
+    backend_name, device_console_feed, device_create_with_display_ports, device_cursor_glyph_copy,
     device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
     device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,
@@ -64,7 +64,8 @@ use std::slice;
 /// [[host-window]]). The symbol is always present; when the staticlib was built
 /// without the `host-window` feature it returns `REIMS_VGPU_QEMU_ERR_STATE` so the C
 /// shim falls back to QEMU's own display.
-pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 18;
+/// v19 adds the explicitly configured, guest-visible display-port count.
+pub const REIMS_VGPU_QEMU_ABI_VERSION: u32 = 19;
 
 #[repr(C)]
 pub struct ReimsVgpuQemuCreateInfo {
@@ -74,6 +75,8 @@ pub struct ReimsVgpuQemuCreateInfo {
     pub host_ops: *const ReimsVgpuHostOps,
     /// Guest page shift: 12 (x86 Tahoe) or 14 (arm64e). 0 is invalid (no default).
     pub guest_page_shift: u32,
+    /// Apple display-pipe count. Required and bounded to `1..=8` by Rust.
+    pub display_port_count: u32,
 }
 
 #[repr(C)]
@@ -129,6 +132,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
             }
             let mut ops = None;
             let mut page_shift = 0u32;
+            let mut display_port_count = 0u32;
             if !info.is_null() {
                 // SAFETY: caller-provided create info.
                 let info = unsafe { &*info };
@@ -139,6 +143,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
                     return REIMS_VGPU_QEMU_ERR_ARGS;
                 }
                 page_shift = info.guest_page_shift;
+                display_port_count = info.display_port_count;
                 if !info.host_ops.is_null() {
                     match copy_host_ops(info.host_ops) {
                         Some(o) => ops = Some(o),
@@ -146,7 +151,7 @@ pub unsafe extern "C" fn reims_vgpu_qemu_device_create(
                     }
                 }
             }
-            let handle = match device_create(ops, page_shift) {
+            let handle = match device_create_with_display_ports(ops, page_shift, display_port_count) {
                 Some(h) => h,
                 None => return REIMS_VGPU_QEMU_ERR_ARGS,
             };
@@ -875,6 +880,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_abi_header_agrees_on_the_default_display_port_count() {
+        assert_eq!(
+            header_define("REIMS_VGPU_DISPLAY_PORT_COUNT_DEFAULT"),
+            crate::model::DEFAULT_DISPLAY_PORT_COUNT,
+        );
+    }
+
     /// The five entry-point return codes agree with the shim header.
     ///
     /// `REIMS_VGPU_QEMU_OK` is the one that matters most and reads the most
@@ -1019,6 +1032,7 @@ mod tests {
             struct_size: std::mem::size_of::<ReimsVgpuQemuCreateInfo>() as u32,
             host_ops: std::ptr::null(),
             guest_page_shift: PAGE_SHIFT_ARM64E, // arm64e — must choose 12 or 14 explicitly
+            display_port_count: crate::model::DEFAULT_DISPLAY_PORT_COUNT,
         };
         let rc = unsafe { reims_vgpu_qemu_device_create(&info, &mut dev) };
         assert_eq!(rc, REIMS_VGPU_QEMU_OK);
@@ -1045,6 +1059,7 @@ mod tests {
             struct_size: std::mem::size_of::<ReimsVgpuQemuCreateInfo>() as u32,
             host_ops: std::ptr::null(),
             guest_page_shift: 0,
+            display_port_count: crate::model::DEFAULT_DISPLAY_PORT_COUNT,
         };
         let rc = unsafe { reims_vgpu_qemu_device_create(&info, &mut dev) };
         assert_eq!(rc, REIMS_VGPU_QEMU_ERR_ARGS);
@@ -1075,6 +1090,7 @@ mod tests {
             struct_size: std::mem::size_of::<ReimsVgpuQemuCreateInfo>() as u32,
             host_ops: std::ptr::null(),
             guest_page_shift: PAGE_SHIFT_X86,
+            display_port_count: crate::model::DEFAULT_DISPLAY_PORT_COUNT,
         };
         assert_eq!(
             unsafe { reims_vgpu_qemu_device_create(&info, &mut dev) },
@@ -1109,6 +1125,7 @@ mod tests {
             struct_size: std::mem::size_of::<ReimsVgpuQemuCreateInfo>() as u32,
             host_ops: std::ptr::null(),
             guest_page_shift: PAGE_SHIFT_X86, // x86 Tahoe
+            display_port_count: crate::model::DEFAULT_DISPLAY_PORT_COUNT,
         };
         assert_eq!(
             unsafe { reims_vgpu_qemu_device_create(&info, &mut dev) },

@@ -186,7 +186,7 @@ struct EngineState {
     pools: ResourcePools,
     counters: EngineCounters,
     #[cfg(feature = "host-window")]
-    window_presenter: Option<window_present::WindowPresenter>,
+    window_presenters: std::collections::BTreeMap<u32, window_present::WindowPresenter>,
 }
 
 impl EngineState {
@@ -197,7 +197,7 @@ impl EngineState {
             pools: ResourcePools::new(),
             counters: EngineCounters::default(),
             #[cfg(feature = "host-window")]
-            window_presenter: None,
+            window_presenters: std::collections::BTreeMap::new(),
         }
     }
 
@@ -205,7 +205,7 @@ impl EngineState {
         if let Some(ctx) = self.owner.ctx.as_ref() {
             unsafe {
                 #[cfg(feature = "host-window")]
-                if let Some(mut presenter) = self.window_presenter.take() {
+                for (_, mut presenter) in std::mem::take(&mut self.window_presenters) {
                     presenter.destroy(ctx, Some(&mut self.pools));
                 }
                 self.caches.destroy_all(&ctx.device);
@@ -441,7 +441,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         ref owner,
         ref mut pools,
         #[cfg(feature = "host-window")]
-        ref mut window_presenter,
+        ref mut window_presenters,
         ..
     } = &mut *guard;
     if let Some(ctx) = owner.ctx.as_ref() {
@@ -451,7 +451,7 @@ pub fn reset_guest_state() -> GuestResetStats {
         }
         unsafe {
             #[cfg(feature = "host-window")]
-            if let Some(presenter) = window_presenter.as_mut() {
+            for presenter in window_presenters.values_mut() {
                 presenter.release_pins_after_idle(pools);
             }
             pools.destroy_all(&ctx.device);
@@ -473,6 +473,7 @@ pub fn reset_guest_state() -> GuestResetStats {
 /// Vulkan instance/device.
 #[cfg(feature = "host-window")]
 pub fn window_present_attach(
+    display_index: u32,
     display: raw_window_handle::RawDisplayHandle,
     window: raw_window_handle::RawWindowHandle,
     width: u32,
@@ -482,14 +483,14 @@ pub fn window_present_attach(
     let EngineState {
         ref mut owner,
         ref counters,
-        ref mut window_presenter,
+        ref mut window_presenters,
         ..
     } = &mut *guard;
-    if window_presenter.is_some() {
+    if window_presenters.contains_key(&display_index) {
         return Ok(());
     }
     let ctx = owner.ensure(counters)?;
-    *window_presenter = Some(unsafe {
+    window_presenters.insert(display_index, unsafe {
         window_present::WindowPresenter::create(ctx, display, window, width, height)?
     });
     Ok(())
@@ -505,25 +506,30 @@ pub fn window_present_attach(
 /// lock there to read one bit would serialize it against the window thread's
 /// own present.
 #[cfg(feature = "host-window")]
-static WINDOW_PRESENT_ATTACHED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+static WINDOW_PRESENT_ATTACHED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Publish the window's rail choice. Called by the window thread from exactly
 /// the two places that create and destroy the presenter.
 #[cfg(feature = "host-window")]
-pub fn note_window_present_attached(attached: bool) {
-    WINDOW_PRESENT_ATTACHED.store(attached, Ordering::Release);
+pub fn note_window_present_attached(display_index: u32, attached: bool) {
+    let bit = 1u32.checked_shl(display_index).unwrap_or(0);
+    if attached {
+        WINDOW_PRESENT_ATTACHED.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        WINDOW_PRESENT_ATTACHED.fetch_and(!bit, Ordering::AcqRel);
+    }
 }
 
 #[cfg(feature = "host-window")]
-pub fn window_present_attached() -> bool {
-    WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire)
+pub fn window_present_attached(display_index: u32) -> bool {
+    let bit = 1u32.checked_shl(display_index).unwrap_or(0);
+    WINDOW_PRESENT_ATTACHED.load(Ordering::Acquire) & bit != 0
 }
 
 #[cfg(feature = "host-window")]
-pub fn window_present_resize(width: u32, height: u32) {
+pub fn window_present_resize(display_index: u32, width: u32, height: u32) {
     let mut guard = lock_engine_at(EngineLockSite::Window);
-    if let Some(presenter) = guard.window_presenter.as_mut() {
+    if let Some(presenter) = guard.window_presenters.get_mut(&display_index) {
         presenter.resize(width, height);
     }
 }
@@ -534,30 +540,34 @@ pub fn window_present_resize(width: u32, height: u32) {
 /// to dispatch WSI releases while `ENGINE` is held.
 #[cfg(feature = "host-window")]
 pub fn window_present_frame(
+    display_index: u32,
     source: Option<&WindowPresentSource>,
     cpu: Option<WindowCpuFrame<'_>>,
+    cursor: Option<&crate::host_window::present::CursorOverlay>,
 ) -> Result<WindowPresentOutcome, DrawError> {
     let mut guard = lock_engine_at(EngineLockSite::Window);
     let EngineState {
         ref mut owner,
         ref mut pools,
         ref counters,
-        ref mut window_presenter,
+        ref mut window_presenters,
         ..
     } = &mut *guard;
     let ctx = owner.ensure(counters)?;
-    let presenter = window_presenter.as_mut().ok_or(DrawError::Facade(
-        EngineFacadeDecline::WindowPresenterNotAttached,
-    ))?;
-    unsafe { presenter.present(ctx, pools, counters, source, cpu) }
+    let presenter = window_presenters
+        .get_mut(&display_index)
+        .ok_or(DrawError::Facade(
+            EngineFacadeDecline::WindowPresenterNotAttached,
+        ))?;
+    unsafe { presenter.present(ctx, pools, counters, source, cpu, cursor) }
 }
 
 /// Destroy the engine-owned surface while the native AppKit window still
 /// exists. Called from winit's `exiting` callback.
 #[cfg(feature = "host-window")]
-pub fn window_present_detach() {
+pub fn window_present_detach(display_index: u32) {
     let mut guard = lock_engine_at(EngineLockSite::Window);
-    let Some(mut presenter) = guard.window_presenter.take() else {
+    let Some(mut presenter) = guard.window_presenters.remove(&display_index) else {
         return;
     };
     let EngineState {
@@ -2359,10 +2369,12 @@ pub fn copy_target_to_guest_pages(
     unsafe { pools.ensure_init(ctx, counters)? };
     let snap = resident_read_snapshot(pools, identity)?;
     if snap.bgra != dst.bgra {
-        return Err(DrawError::GuestPageWrite(GuestWriteDecline::OrderMismatch {
-            resident_bgra: snap.bgra,
-            want_bgra: dst.bgra,
-        }));
+        return Err(DrawError::GuestPageWrite(
+            GuestWriteDecline::OrderMismatch {
+                resident_bgra: snap.bgra,
+                want_bgra: dst.bgra,
+            },
+        ));
     }
     if snap.width != dst.width || snap.height != dst.height {
         return Err(DrawError::GuestPageWrite(
@@ -2835,12 +2847,14 @@ unsafe fn publish_previous_writeback_timestamps(ctx: &context::DeviceContext) {
         return;
     };
     let mut ticks = [0u64; context::TimestampProbe::SLOTS as usize];
-    match unsafe { ctx.device.get_query_pool_results(
-        probe.pool,
-        0,
-        &mut ticks,
-        ash::vk::QueryResultFlags::TYPE_64,
-    ) } {
+    match unsafe {
+        ctx.device.get_query_pool_results(
+            probe.pool,
+            0,
+            &mut ticks,
+            ash::vk::QueryResultFlags::TYPE_64,
+        )
+    } {
         // In f64, not integer ticks-times-period: `timestampPeriod` is a
         // float and drivers do report values below 1 ns, which an integer
         // multiply would truncate to zero and report as "the GPU did nothing".

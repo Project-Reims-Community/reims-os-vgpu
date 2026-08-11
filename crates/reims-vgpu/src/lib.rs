@@ -92,7 +92,8 @@ pub mod host_window;
 /// `display_surface` and `window_publish` already use.
 mod device;
 pub(crate) use device::{
-    backend_name, device_console_feed, device_create, device_cursor_glyph_copy,
+    backend_name, device_console_feed, device_create_with_display_ports,
+    device_cursor_glyph_copy,
     device_cursor_glyph_info, device_destroy, device_drain, device_efi_console_copy,
     device_gfx_read, device_gfx_write, device_iosfc_read, device_iosfc_write, device_poll,
     device_pop_action, device_reset, device_scanout_copy, device_scanout_may_paint,

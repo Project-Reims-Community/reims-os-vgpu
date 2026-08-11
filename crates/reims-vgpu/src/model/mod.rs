@@ -15,7 +15,7 @@ pub(crate) use regs::*;
 // `mod`, so this is the only path those links can name — and rustc's
 // unused-import lint cannot see a doc link, so it will call this dead.
 pub use state::{
-    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, ExecFault,
+    ChannelRing, ComputeStorageResidencyKey, DeviceId, DeviceState, DisplayHandshake, ExecFault,
     FailEvent, GfxRegs, GuestLinearMemo, GvaBacking, GvaEvictionWitness,
     GvaHostView, HostLinearTexture, HostSurface, MapperCapture, MappingEntry,
     PacketFault, PresentBacking, PresentState, RenderFlushWitness, ResourceValidity, SurfaceWriteKind, TaskEntry, TaskTable, Type4Walk, UnimplementedCommand, FENCE_DOMAIN_BLIT,
@@ -42,6 +42,19 @@ impl<B: Backend> Device<B> {
             state: DeviceState::new(id, page_shift),
             backend,
         }
+    }
+
+    /// Construct a device with an explicit guest-visible display-port count.
+    pub fn new_with_display_ports(
+        id: DeviceId,
+        backend: B,
+        page_shift: u32,
+        display_port_count: u32,
+    ) -> Option<Self> {
+        Some(Self {
+            state: DeviceState::new_with_display_ports(id, page_shift, display_port_count)?,
+            backend,
+        })
     }
 
     pub fn reset(&mut self) {
@@ -311,7 +324,7 @@ mod tests {
         );
         assert_eq!(
             d.gfx_read(GFX_REG_EFI_DISPLAY_PORTS, MMIO_U32),
-            EFI_DISPLAY_PORT_COUNT as u64
+            DEFAULT_DISPLAY_PORT_COUNT as u64
         );
         assert_eq!(
             d.gfx_read(GFX_REG_EFI_BUILTIN_CONNECTED, MMIO_U32),
@@ -320,6 +333,30 @@ mod tests {
         let size = d.gfx_read(GFX_REG_EFI_MODE_SIZE, MMIO_U32);
         assert_eq!(size >> EFI_MODE_WIDTH_SHIFT, EFI_BOOT_WIDTH as u64);
         assert_eq!(size & 0xffff, EFI_BOOT_HEIGHT as u64);
+    }
+
+    #[test]
+    fn an_explicit_display_count_is_guest_visible_and_survives_reset() {
+        let backend = NullBackend;
+        let mut d = Device::new_with_display_ports(DeviceId(9), backend, PAGE_SHIFT_X86, 2)
+            .expect("two ports are inside the guest contract");
+        assert_eq!(d.gfx_read(GFX_REG_EFI_DISPLAY_PORTS, MMIO_U32), 2);
+        d.reset();
+        assert_eq!(d.gfx_read(GFX_REG_EFI_DISPLAY_PORTS, MMIO_U32), 2);
+        assert!(Device::new_with_display_ports(
+            DeviceId(10),
+            NullBackend,
+            PAGE_SHIFT_X86,
+            0,
+        )
+        .is_none());
+        assert!(Device::new_with_display_ports(
+            DeviceId(11),
+            NullBackend,
+            PAGE_SHIFT_X86,
+            MAX_DISPLAY_PORT_COUNT + 1,
+        )
+        .is_none());
     }
 
     #[test]

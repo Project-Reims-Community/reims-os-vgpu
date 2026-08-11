@@ -1,6 +1,9 @@
 //! Device-owned state: registers, rings, tasks, mapper, present, fail log.
 
-use crate::model::{LruBytesMemo, GFX_MMIO_SIZE, MAX_CHANNELS};
+use crate::model::{
+    LruBytesMemo, DEFAULT_DISPLAY_PORT_COUNT, GFX_MMIO_SIZE, MAX_CHANNELS,
+    MAX_DISPLAY_PORT_COUNT,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -2015,9 +2018,24 @@ pub struct DeviceState {
     pub fence_flushed_mappings: std::collections::BTreeSet<u32>,
     /// Per-mid last write **command class** (ClearOnly vs Composite) — present path.
     pub surface_write_kind: BTreeMap<u32, SurfaceWriteKind>,
+    /// Display ports exposed through `GFX_REG_EFI_DISPLAY_PORTS`.
+    /// Construction bounds this to the guest driver's own `1..=8` contract.
+    pub display_port_count: u32,
+    /// Display pipe owning the most recently accepted present. The existing
+    /// presentation machinery resolves one packet at a time; this routes that
+    /// finished frame to the matching host output before the next packet runs.
+    pub present_display_index: u32,
     pub present: PresentState,
     pub cursor: CursorState,
+    /// Primary display handshake retained at its historical field so the
+    /// one-display path stays structurally unchanged.
     pub display: DisplayHandshake,
+    /// Additional display-pipe handshakes, keyed by the guest's pipe index.
+    pub additional_displays: BTreeMap<u32, DisplayHandshake>,
+    /// Child channel → display-pipe index learned from SetupSharedState.
+    /// The mapping is guest-declared rather than reconstructed from a fixed
+    /// channel number, so x86 and arm64 may use different channel layouts.
+    pub display_channels: BTreeMap<u32, u32>,
     /// Every `FailEvent` also reached the always-on log through `record_fail`;
     /// this vec is only how an in-crate test reads them back. It is
     /// `#[cfg(test)]` because in a product boot nothing ever read it, so it grew
@@ -2121,7 +2139,20 @@ impl DeviceState {
     /// `page_shift` must be **12** (x86_64 / Tahoe) or **14** (arm64e). There
     /// is no default — product create and tests must choose explicitly.
     pub fn new(id: DeviceId, page_shift: u32) -> Self {
-        Self {
+        Self::new_with_display_ports(id, page_shift, DEFAULT_DISPLAY_PORT_COUNT)
+            .expect("the default display-port count is valid")
+    }
+
+    /// Create device state with an explicit guest-visible display-port count.
+    pub fn new_with_display_ports(
+        id: DeviceId,
+        page_shift: u32,
+        display_port_count: u32,
+    ) -> Option<Self> {
+        if !(1..=MAX_DISPLAY_PORT_COUNT).contains(&display_port_count) {
+            return None;
+        }
+        Some(Self {
             id,
             page_shift,
             gfx: GfxRegs::default(),
@@ -2156,6 +2187,8 @@ impl DeviceState {
             compute_storage_residency: BTreeMap::new(),
             fence_flushed_mappings: std::collections::BTreeSet::new(),
             surface_write_kind: BTreeMap::new(),
+            display_port_count,
+            present_display_index: 0,
             present: PresentState::default(),
             cursor: CursorState {
                 show: true,
@@ -2164,6 +2197,8 @@ impl DeviceState {
             mapper_capture: None,
             mapper_device_kva: 0,
             display: DisplayHandshake::default(),
+            additional_displays: BTreeMap::new(),
+            display_channels: BTreeMap::new(),
             #[cfg(test)]
             fails: Vec::new(),
             fence_generations: BTreeMap::new(),
@@ -2187,7 +2222,45 @@ impl DeviceState {
             type11_memo_scratch: Vec::new(),
             gva_host_views: Vec::new(),
             view_stale_reads: 0,
+        })
+    }
+
+    /// Display handshake for one advertised pipe.
+    pub fn display_pipe(&self, index: u32) -> Option<&DisplayHandshake> {
+        if index >= self.display_port_count {
+            None
+        } else if index == 0 {
+            Some(&self.display)
+        } else {
+            self.additional_displays.get(&index)
         }
+    }
+
+    /// Mutable display handshake, creating an advertised secondary pipe when
+    /// the guest registers its shared-state page.
+    pub fn display_pipe_mut(&mut self, index: u32) -> Option<&mut DisplayHandshake> {
+        if index >= self.display_port_count {
+            None
+        } else if index == 0 {
+            Some(&mut self.display)
+        } else {
+            Some(self.additional_displays.entry(index).or_default())
+        }
+    }
+
+    /// Pipe index previously registered on a child channel.
+    pub fn display_pipe_for_channel(&self, channel: u32) -> Option<u32> {
+        self.display_channels.get(&channel).copied()
+    }
+
+    /// Every registered pipe index, with the primary first when present.
+    pub fn registered_display_pipes(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.additional_displays.len() + 1);
+        if self.display.shared_gpa != 0 {
+            out.push(0);
+        }
+        out.extend(self.additional_displays.keys().copied());
+        out
     }
 
 
@@ -2478,6 +2551,7 @@ impl DeviceState {
         }
         let id = self.id;
         let page_shift = self.page_shift;
+        let display_port_count = self.display_port_count;
         // Keep the interrupt-status Arcs wired to the registry slot: the
         // lock-free ISR read rail clones them once at device create.
         let intr_disp = Arc::clone(&self.gfx.interrupt_status_disp);
@@ -2492,7 +2566,8 @@ impl DeviceState {
         // Cleared as well as kept: a reset drops every channel, so a bit rung
         // before it names a channel that no longer exists.
         child_rung.store(0, Ordering::Release);
-        *self = Self::new(id, page_shift);
+        *self = Self::new_with_display_ports(id, page_shift, display_port_count)
+            .expect("a live device already carries a valid display-port count");
         self.gfx.interrupt_status_disp = intr_disp;
         self.gfx.interrupt_status_gpu = intr_gpu;
         self.gfx.interrupt_fault = intr_fault;

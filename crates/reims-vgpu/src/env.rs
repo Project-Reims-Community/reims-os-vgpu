@@ -40,6 +40,12 @@ pub const GUEST_IMPORT: &str = "REIMS_VGPU_GUEST_IMPORT";
 /// Verbose per-draw logging on top of the always-on fail sink.
 pub const DRAW_LOG: &str = "REIMS_VGPU_DRAW_LOG";
 
+/// Composite the guest hardware-cursor plane into host-window presents.
+/// This is presentation policy rather than a capability override: `On` asks
+/// for the overlay, while every other value keeps the original host-pointer
+/// path unchanged.
+pub const CURSOR_OVERLAY: &str = "REIMS_VGPU_CURSOR";
+
 /// Setting this off makes a completion stamp that follows a guest-page writeback
 /// block the drain worker on that writeback and then write the stamp word
 /// itself, instead of recording the word into the same GPU queue behind the

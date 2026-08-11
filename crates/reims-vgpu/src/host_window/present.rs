@@ -31,10 +31,10 @@ use std::sync::{Arc, Mutex};
 
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use super::input_map;
 use crate::runtime::host::HostAction;
@@ -107,6 +107,8 @@ const GUEST_RESIZE_WARN_AFTER: std::time::Duration = std::time::Duration::from_s
 /// Window creation parameters.
 #[derive(Clone, Debug)]
 pub struct WindowConfig {
+    pub display_index: u32,
+    pub display_count: u32,
     pub title: String,
     pub width: u32,
     pub height: u32,
@@ -115,6 +117,8 @@ pub struct WindowConfig {
 impl Default for WindowConfig {
     fn default() -> Self {
         Self {
+            display_index: 0,
+            display_count: 1,
             title: "Reims vGPU".to_string(),
             width: 1280,
             height: 800,
@@ -127,6 +131,7 @@ impl Default for WindowConfig {
 /// the delivery BH (both thread-safe), so guest input flows without the device
 /// lock.
 pub type InputSink = Arc<dyn Fn(HostAction) + Send + Sync>;
+type PointerTracker = Arc<Mutex<Option<(i32, i32)>>>;
 
 /// The latest guest frame to present (BGRA8, tightly packed `width*height*4`).
 /// `None` until the first present capture; the window clears to a flat color
@@ -147,6 +152,21 @@ pub struct Frame {
     pub bgra: Vec<u8>,
     /// Engine-resident source for same-device MoltenVK presentation.
     pub resident: Option<crate::backend::vulkan::engine::WindowPresentSource>,
+    /// Guest hardware cursor for this display at publication time.
+    pub cursor: Option<CursorOverlay>,
+}
+
+/// An immutable guest cursor snapshot. Pixels are QEMU's `0xAARRGGBB` words;
+/// `(x, y)` names the hotspot in guest-display coordinates.
+#[derive(Clone)]
+pub struct CursorOverlay {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub pixels: Arc<Vec<u32>>,
 }
 
 /// Shared slot the device writes and the window reads (latest-wins). The frame
@@ -161,7 +181,7 @@ pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 /// lock, so a payload here could only be a second, staler copy of what
 /// [`App::draw`] is about to read anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FramePublished;
+pub struct FramePublished(pub u32);
 
 /// How the device wakes the window's event loop when it publishes a frame.
 ///
@@ -185,6 +205,7 @@ pub struct FramePublished;
 /// lock is uncontended and taken once per published frame, at the ~26 Hz this
 /// workload peaks at, against the publisher's own two existing locks.
 pub struct WindowWaker {
+    display_index: u32,
     proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
 }
 
@@ -195,8 +216,9 @@ pub type WindowWakeHandle = Arc<WindowWaker>;
 impl WindowWaker {
     /// An unarmed waker. [`Self::wake`] is a no-op until the window thread has
     /// built its event loop and called [`Self::arm`].
-    pub fn new() -> WindowWakeHandle {
+    pub fn new(display_index: u32) -> WindowWakeHandle {
         Arc::new(Self {
+            display_index,
             proxy: Mutex::new(None),
         })
     }
@@ -219,7 +241,7 @@ impl WindowWaker {
     pub fn wake(&self) {
         if let Ok(slot) = self.proxy.lock() {
             if let Some(proxy) = slot.as_ref() {
-                let _ = proxy.send_event(FramePublished);
+                let _ = proxy.send_event(FramePublished(self.display_index));
             }
         }
     }
@@ -289,6 +311,21 @@ fn pointer_report(
             window.1,
         ),
     }
+}
+
+fn desktop_pointer_report(
+    local: (u32, u32, u32, u32),
+    display_index: u32,
+    display_count: u32,
+) -> (u32, u32, u32, u32) {
+    let (x, y, width, height) = local;
+    let count = display_count.max(1);
+    (
+        x.saturating_add(width.saturating_mul(display_index.min(count - 1))),
+        y,
+        width.saturating_mul(count),
+        height,
+    )
 }
 
 /// Whether a newly observed guest frame geometry should request a native
@@ -503,6 +540,102 @@ pub fn spawn(
         .expect("spawn reims-vgpu-window thread")
 }
 
+pub struct WindowSpec {
+    pub config: WindowConfig,
+    pub on_input: InputSink,
+    pub frames: FrameSlot,
+    pub wake: WindowWakeHandle,
+}
+
+pub fn spawn_many(
+    specs: Vec<WindowSpec>,
+    stop: StopFlag,
+) -> std::thread::JoinHandle<Result<(), WindowError>> {
+    std::thread::Builder::new()
+        .name("reims-vgpu-windows".to_string())
+        .spawn(move || run_many(specs, stop))
+        .expect("spawn reims-vgpu windows thread")
+}
+
+fn run_many(specs: Vec<WindowSpec>, stop: StopFlag) -> Result<(), WindowError> {
+    let event_loop = build_event_loop()?;
+    let proxy = event_loop.create_proxy();
+    let mut apps = Vec::with_capacity(specs.len());
+    let pointer_tracker: PointerTracker = Arc::new(Mutex::new(None));
+    for spec in specs {
+        spec.wake.arm(proxy.clone());
+        apps.push(App::new(
+            spec.config,
+            spec.on_input,
+            spec.frames,
+            Arc::clone(&stop),
+            Arc::clone(&pointer_tracker),
+        ));
+    }
+    let mut app = MultiApp { apps };
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| WindowError::RunApp(e.to_string()))
+}
+
+struct MultiApp {
+    apps: Vec<App>,
+}
+
+impl ApplicationHandler<FramePublished> for MultiApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        for app in &mut self.apps {
+            app.resumed(event_loop);
+        }
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        if let Some(app) = self
+            .apps
+            .iter_mut()
+            .find(|app| app.window.as_ref().is_some_and(|window| window.id() == id))
+        {
+            app.window_event(event_loop, id, event);
+        }
+    }
+
+    fn exiting(&mut self, event_loop: &ActiveEventLoop) {
+        for app in &mut self.apps {
+            app.exiting(event_loop);
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        for app in &mut self.apps {
+            app.about_to_wait(event_loop);
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: FramePublished) {
+        if let Some(app) = self
+            .apps
+            .iter_mut()
+            .find(|app| app.config.display_index == event.0)
+        {
+            app.user_event(event_loop, event);
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        let DeviceEvent::MouseMotion { delta } = event else {
+            return;
+        };
+        if let Some(app) = self.apps.iter_mut().find(|app| app.pointer_captured) {
+            app.raw_pointer_motion(delta);
+        }
+    }
+}
+
 /// Run the window event loop on the calling thread (blocks until the window
 /// closes). Prefer [`spawn`]; call this directly only if you already own a
 /// suitable thread.
@@ -515,7 +648,7 @@ pub fn run(
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(config, on_input, frames, stop, Arc::new(Mutex::new(None)));
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -562,7 +695,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(config, on_input, frames, stop, Arc::new(Mutex::new(None)));
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -634,6 +767,8 @@ struct App {
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
+    pointer_tracker: PointerTracker,
+    pointer_captured: bool,
     /// The engine presenter holds a swapchain on this window's surface. False
     /// before the attach in `resumed` and again after `exiting` releases it;
     /// there is no other presenter, so false means nothing can be drawn.
@@ -682,6 +817,7 @@ struct App {
 /// is touched only by the thread that owns the loop.
 #[derive(Debug)]
 struct LoopCensus {
+    display_index: u32,
     window_started: std::time::Instant,
     /// `about_to_wait` entries: how often the loop woke at all.
     ticks: u64,
@@ -705,8 +841,9 @@ struct LoopCensus {
 }
 
 impl LoopCensus {
-    fn new() -> Self {
+    fn new(display_index: u32) -> Self {
         Self {
+            display_index,
             window_started: std::time::Instant::now(),
             ticks: 0,
             redraws_asked: 0,
@@ -731,8 +868,9 @@ impl LoopCensus {
             return;
         }
         crate::observe::off(format!(
-            "host_window_loop win_ms={} ticks={} redraws_asked={} draws={} \
+            "host_window_loop display={} win_ms={} ticks={} redraws_asked={} draws={} \
              draws_fresh={} draws_stale={} draws_held={}",
+            self.display_index,
             elapsed.as_millis(),
             self.ticks,
             self.redraws_asked,
@@ -741,7 +879,7 @@ impl LoopCensus {
             self.draws_stale,
             self.draws_held,
         ));
-        *self = Self::new();
+        *self = Self::new(self.display_index);
     }
 }
 
@@ -786,6 +924,7 @@ impl ApplicationHandler<FramePublished> for App {
             .and_then(|(display, handle)| {
                 let size = window.inner_size();
                 crate::backend::vulkan::engine::window_present_attach(
+                    self.config.display_index,
                     display,
                     handle,
                     size.width.max(1),
@@ -796,9 +935,15 @@ impl ApplicationHandler<FramePublished> for App {
         match attach {
             Ok(()) => {
                 self.engine_attached = true;
-                crate::backend::vulkan::engine::note_window_present_attached(true);
+                crate::backend::vulkan::engine::note_window_present_attached(
+                    self.config.display_index,
+                    true,
+                );
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
+                window.set_cursor_visible(
+                    crate::env::switch(crate::env::CURSOR_OVERLAY) != crate::env::Switch::On,
+                );
                 window.request_redraw();
                 self.window = Some(window);
             }
@@ -849,7 +994,11 @@ impl ApplicationHandler<FramePublished> for App {
             WindowEvent::Resized(size) => {
                 let applied = (size.width.max(1), size.height.max(1));
                 if self.engine_attached {
-                    crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
+                    crate::backend::vulkan::engine::window_present_resize(
+                        self.config.display_index,
+                        applied.0,
+                        applied.1,
+                    );
                     self.note_guest_resize_applied(applied);
                 }
                 // Fresh swapchain images hold nothing; the seq gate would
@@ -859,6 +1008,13 @@ impl ApplicationHandler<FramePublished> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
+                    if code == KeyCode::Escape
+                        && event.state == ElementState::Pressed
+                        && self.pointer_captured
+                    {
+                        self.release_pointer();
+                        return;
+                    }
                     if let Some(evdev) = input_map::keycode_to_evdev(code) {
                         let down = event.state == ElementState::Pressed;
                         (self.on_input)(HostAction::input_key(evdev, down));
@@ -866,9 +1022,24 @@ impl ApplicationHandler<FramePublished> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.pointer_move((position.x, position.y));
+                if !self.pointer_captured {
+                    self.pointer_move((position.x, position.y));
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                let was_captured = self.pointer_captured;
+                if self.config.display_count > 1
+                    && state == ElementState::Pressed
+                    && !self.pointer_captured
+                {
+                    self.capture_pointer();
+                    if !was_captured && self.pointer_captured {
+                        // The activating click belongs to the host capture
+                        // gesture. Forwarding it would click wherever the guest
+                        // cursor happened to be before raw motion began.
+                        return;
+                    }
+                }
                 if let Some(btn) = input_map::mouse_button(button) {
                     (self.on_input)(HostAction::input_pointer_button(
                         btn,
@@ -897,10 +1068,14 @@ impl ApplicationHandler<FramePublished> for App {
         // freed `wl_proxy` and crash. winit calls this before the loop ends, so
         // the ordering is explicit here rather than left to drop order.
         if self.engine_attached {
-            crate::backend::vulkan::engine::window_present_detach();
-            crate::backend::vulkan::engine::note_window_present_attached(false);
+            crate::backend::vulkan::engine::window_present_detach(self.config.display_index);
+            crate::backend::vulkan::engine::note_window_present_attached(
+                self.config.display_index,
+                false,
+            );
             self.engine_attached = false;
         }
+        self.release_pointer();
         self.window = None;
     }
 
@@ -984,7 +1159,14 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        stop: StopFlag,
+        pointer_tracker: PointerTracker,
+    ) -> Self {
+        let display_index = config.display_index;
         Self {
             config,
             on_input,
@@ -993,6 +1175,8 @@ impl App {
             closed_sent: false,
             window: None,
             cursor: (0, 0),
+            pointer_tracker,
+            pointer_captured: false,
             engine_attached: false,
             first_engine_present_logged: false,
             first_engine_guest_logged: false,
@@ -1006,7 +1190,7 @@ impl App {
             engine_redraw_required: true,
             guest_extent: None,
             pending_guest_resize: None,
-            loop_census: LoopCensus::new(),
+            loop_census: LoopCensus::new(display_index),
         }
     }
 
@@ -1054,10 +1238,66 @@ impl App {
     /// before the first frame the full-window space is forwarded unchanged.
     /// See [`pointer_report`], which holds the decision and its tests.
     fn pointer_move(&mut self, position: (f64, f64)) {
+        let local = pointer_report(position, self.surface_dims(), self.guest_extent);
         let (x, y, width, height) =
-            pointer_report(position, self.surface_dims(), self.guest_extent);
+            desktop_pointer_report(local, self.config.display_index, self.config.display_count);
         self.cursor = (x, y);
-        (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+        if self.config.display_count == 1 {
+            (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+        }
+    }
+
+    fn capture_pointer(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        // The guest overlay owns cursor visibility when enabled. Otherwise the
+        // host pointer remains the compatibility path for captured input.
+        let grabbed = window.set_cursor_grab(CursorGrabMode::Confined);
+        if let Err(error) = grabbed {
+            crate::observe::fail(format!(
+                "host_window_pointer_capture FAIL display={} reason={error}",
+                self.config.display_index
+            ));
+            return;
+        }
+        window.set_cursor_visible(
+            crate::env::switch(crate::env::CURSOR_OVERLAY) != crate::env::Switch::On,
+        );
+        self.pointer_captured = true;
+        if let Ok(mut tracker) = self.pointer_tracker.lock() {
+            *tracker = None;
+        }
+        crate::observe::off(format!(
+            "host_window_pointer_capture display={} state=captured release=escape",
+            self.config.display_index
+        ));
+    }
+
+    fn release_pointer(&mut self) {
+        if !self.pointer_captured {
+            return;
+        }
+        if let Some(window) = self.window.as_ref() {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(
+                crate::env::switch(crate::env::CURSOR_OVERLAY) != crate::env::Switch::On,
+            );
+        }
+        self.pointer_captured = false;
+        crate::observe::off(format!(
+            "host_window_pointer_capture display={} state=released",
+            self.config.display_index
+        ));
+    }
+
+    fn raw_pointer_motion(&self, delta: (f64, f64)) {
+        let clamp = |value: f64| value.round().clamp(i32::MIN as f64, i32::MAX as f64) as i32;
+        let dx = clamp(delta.0);
+        let dy = clamp(delta.1);
+        if dx != 0 || dy != 0 {
+            (self.on_input)(HostAction::input_pointer_relative(dx, dy));
+        }
     }
 
     /// Present one frame through the engine presenter, or decide there is
@@ -1094,8 +1334,10 @@ impl App {
         }
         self.loop_census.draws_fresh += 1;
         let result = crate::backend::vulkan::engine::window_present_frame(
+            self.config.display_index,
             frame.as_ref().and_then(|frame| frame.resident.as_ref()),
             frame.as_deref().map(window_cpu_frame),
+            frame.as_deref().and_then(|frame| frame.cursor.as_ref()),
         );
         match result {
             Ok(crate::backend::vulkan::engine::WindowPresentOutcome::Busy) => {}
@@ -1192,7 +1434,11 @@ impl App {
         if let Some(applied) = immediate {
             // Applied synchronously — winit emits no later `Resized` for it.
             let applied = (applied.width.max(1), applied.height.max(1));
-            crate::backend::vulkan::engine::window_present_resize(applied.0, applied.1);
+            crate::backend::vulkan::engine::window_present_resize(
+                self.config.display_index,
+                applied.0,
+                applied.1,
+            );
             self.engine_redraw_required = true;
             self.note_guest_resize_applied(applied);
         }
@@ -1225,7 +1471,7 @@ mod loop_census_tests {
     /// is every publish, every input event and every backstop.
     #[test]
     fn a_partial_window_accumulates_rather_than_emitting() {
-        let mut census = LoopCensus::new();
+        let mut census = LoopCensus::new(0);
         census.tick();
         census.tick();
         assert_eq!(census.ticks, 2);
@@ -1236,7 +1482,7 @@ mod loop_census_tests {
     /// next line is a rate rather than a running total.
     #[test]
     fn a_closed_window_resets_every_counter() {
-        let mut census = LoopCensus::new();
+        let mut census = LoopCensus::new(0);
         census.draws = 9;
         census.draws_fresh = 4;
         census.draws_stale = 5;
@@ -1256,7 +1502,7 @@ mod loop_census_tests {
     /// the shape of a frame this device drops with no line saying so.
     #[test]
     fn the_dispositions_sum_to_the_draws() {
-        let mut census = LoopCensus::new();
+        let mut census = LoopCensus::new(0);
         census.draws = 12;
         census.draws_fresh = 5;
         census.draws_stale = 6;
@@ -1280,7 +1526,7 @@ mod wake_tests {
     /// what makes that safe, and this pins that the gap is quiet.
     #[test]
     fn an_unarmed_waker_takes_a_wake_and_does_nothing_with_it() {
-        let waker = WindowWaker::new();
+        let waker = WindowWaker::new(0);
         waker.wake();
         waker.wake();
         assert!(
@@ -1354,7 +1600,8 @@ mod wake_tests {
                 backstop = now + ENGINE_WINDOW_REDRAW_BACKSTOP;
             }
         }
-        let backstop_ticks = (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
+        let backstop_ticks =
+            (second.as_millis() / ENGINE_WINDOW_REDRAW_BACKSTOP.as_millis()) as u32;
         assert!(
             requested <= publishes + backstop_ticks,
             "asked {requested} times for {publishes} frames — a pacing rule \
@@ -1642,6 +1889,13 @@ mod tests {
             pointer_report((960.0, 540.0), (1920, 1080), Some((3840, 2160))),
             (1920, 1080, 3840, 2160)
         );
+    }
+
+    #[test]
+    fn each_window_maps_into_its_own_horizontal_desktop_region() {
+        let local = (320, 240, 1920, 1080);
+        assert_eq!(desktop_pointer_report(local, 0, 2), (320, 240, 3840, 1080));
+        assert_eq!(desktop_pointer_report(local, 1, 2), (2240, 240, 3840, 1080));
     }
 
     /// The measured x86/Linux answers. Three of the guest's four modes come

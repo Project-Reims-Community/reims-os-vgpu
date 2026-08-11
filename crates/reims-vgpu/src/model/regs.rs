@@ -85,7 +85,11 @@ pub const EFI_BOOT_HEIGHT: u32 = 1080;
 pub const EFI_MODE_WIDTH_SHIFT: u32 = 16;
 pub const EFI_MODE_COUNT: u32 = 1;
 pub const EFI_STRIDE_ALIGNMENT: u32 = 64;
-pub const EFI_DISPLAY_PORT_COUNT: u32 = 1;
+/// The one-display behavior existing machines get unless their QEMU device
+/// explicitly asks for more ports.
+pub const DEFAULT_DISPLAY_PORT_COUNT: u32 = 1;
+/// AppleParavirtDisplayPipe clamps the advertised port count into `1..=8`.
+pub const MAX_DISPLAY_PORT_COUNT: u32 = 8;
 pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 
 /// How many channel ids this device has state for, including the root FIFO.
@@ -109,7 +113,8 @@ pub const EFI_BUILTIN_CONNECTED: u32 = 1;
 /// The pipe count is the only negotiated half, and it is negotiated *downwards*:
 /// the guest reads [`GFX_REG_EFI_DISPLAY_PORTS`] and clamps it into `1..=8`
 /// itself, so this device cannot widen the range by advertising more. At the
-/// [`EFI_DISPLAY_PORT_COUNT`] published here it creates channels 0..=5.
+/// [`DEFAULT_DISPLAY_PORT_COUNT`] published by default it creates channels
+/// 0..=5.
 ///
 /// The bound is therefore not tight, and it is not load-bearing either — see
 /// [`accept_child_channel`] for what a refusal past it would cost. It is pinned
@@ -693,13 +698,9 @@ pub const SET_OBJECT_LIST_PFN: usize = 0x04;
 pub const SET_OBJECT_LIST_COUNT: usize = 0x08;
 pub const SET_OBJECT_LIST_LEN: usize = 12;
 
-// `CmdDisplaySwapMapping`'s trailer is `[display][_][mapping]`. Only the
-// mapping is read; the display index has no reader here, and it stays named
-// because a decoded guest field with no name is the one nobody notices being
-// ignored. Whether ignoring it is correct is not established — it needs the
-// display count this device advertises, which no boot on this rig has
-// measured. Its own length lives at `display_txn_trailer_len`.
-#[allow(dead_code)] // named on purpose and read by nothing — see above.
+// `CmdDisplaySwapMapping`'s trailer is `[display][_][mapping]`. The display
+// word selects the independently advertised output; the mapping names that
+// output's next frame. Its own length lives at `display_txn_trailer_len`.
 pub const DISPLAY_SWAP_DISPLAY: usize = 0x00;
 pub const DISPLAY_SWAP_MAPPING: usize = 0x08;
 

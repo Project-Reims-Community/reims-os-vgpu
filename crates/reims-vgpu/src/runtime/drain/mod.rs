@@ -19,6 +19,7 @@ use crate::runtime::gpa_map;
 use crate::runtime::heap_query::QueryError;
 use crate::runtime::host::{HostAction, HostMemory, HostOps, MemError};
 use crate::runtime::task_slot::{resolve_task_word, TaskWordSite};
+use std::sync::Arc;
 
 pub(crate) mod census;
 pub use census::*;
@@ -381,6 +382,16 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     }
     let index = ld32(&payload[CHILD_SHARED_STATE_INDEX..]);
     let pfn = ld32(&payload[CHILD_SHARED_STATE_PFN..]);
+    let shared_gpa = state.pfn_gpa(pfn);
+    let page_size = state.page_size();
+    let Some(display) = state.display_pipe_mut(index) else {
+        crate::observe::fail(format!(
+            "display_shared_state_unadvertised index={index} ports={} ch={}",
+            state.display_port_count,
+            channel.map_or_else(|| "root".to_string(), |c| c.to_string())
+        ));
+        return;
+    };
     // reinit=1 means the guest tears down + re-registers the display
     // shared page while it was already ONLINE — the AppleParavirtDisplayPipe
     // setupSharedState/teardownSharedState re-init that makes WindowServer
@@ -388,22 +399,25 @@ fn apply_setup_shared_state<H: HostMemory + HostOps>(
     // A reinit AFTER present_converge is the smoking gun for the intermittent
     // post-converge boot-progress overlay. Rare
     // event → always-on so a bad boot leaves a display-lifecycle timeline.
-    let reinit = state.display.online_acked as u8;
-    state.display.display_index = index;
-    state.display.shared_gpa = state.pfn_gpa(pfn);
-    state.display.online_acked = false;
-    state.display.online_tries = 0;
-    state.display.poll_ctr = 0;
+    let reinit = display.online_acked as u8;
+    display.display_index = index;
+    display.shared_gpa = shared_gpa;
+    display.online_acked = false;
+    display.online_tries = 0;
+    display.poll_ctr = 0;
+    if let Some(channel) = channel {
+        state.display_channels.insert(channel, index);
+    }
     crate::observe::fail(format!(
         "display_shared_state_setup index={index} gpa={:#x} reinit={reinit} ch={}",
-        state.display.shared_gpa,
+        shared_gpa,
         channel.map_or_else(|| "root".to_string(), |c| c.to_string())
     ));
     // Archive apple_pv_gpu_display_setup: fill descriptor + modes
     // before completion so createDisplayAttributes sees TimingElements.
     // Do **not** pulse ONLINE here — enable() has not set +0x104 yet
     // (archive poll waits for mask bit 2, then pending+IRQ).
-    fill_display_descriptor(host, state.display.shared_gpa, index, state.page_size());
+    fill_display_descriptor(host, shared_gpa, index, page_size);
 }
 
 fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u32>) {
@@ -416,7 +430,10 @@ fn apply_delete_task(state: &mut DeviceState, payload: &[u8], channel: Option<u3
     // names bytes that are no longer this task's. Here rather than at the two
     // call sites: the root and child FIFOs both reach this, and a rule written
     // twice is the one that diverges.
-    note_bb_retired("bb_retire_delete_task", state.retire_bound_buffers_for_task(task_id));
+    note_bb_retired(
+        "bb_retire_delete_task",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     let ok = state.delete_task(task_id);
     crate::observe::off(format!(
         "delete_task site={} task={task_id} ok={} plen={}",
@@ -510,7 +527,10 @@ fn apply_define_task2<H: HostMemory + HostOps>(
     // through the old one may translate elsewhere now. Keyed on the shifted
     // `task_id`, not `raw_id` — the registry is keyed the way the draw path
     // keys it, and `raw_id` is the wrong number by a factor of two.
-    note_bb_retired("bb_retire_define_task2", state.retire_bound_buffers_for_task(task_id));
+    note_bb_retired(
+        "bb_retire_define_task2",
+        state.retire_bound_buffers_for_task(task_id),
+    );
     state.define_task(task_id, length, dir);
     // Capture directory + root/depth so one boot shows the page-table identity.
     let Some(slot) = state.tasks.get(task_id) else {
@@ -598,6 +618,12 @@ fn present_surface_id(opcode: u16, payload: &[u8]) -> Option<u32> {
         let off = display_txn_trailer_slots(opcode).0 * 4;
         ld32(&payload[off..])
     })
+}
+
+/// Display pipe named by every display transaction trailer.
+fn present_display_index(opcode: u16, payload: &[u8]) -> Option<u32> {
+    (payload.len() >= display_txn_trailer_len(opcode))
+        .then(|| ld32(&payload[DISPLAY_SWAP_DISPLAY..]))
 }
 
 /// Alarm for a display-transaction payload longer than its command declares.
@@ -725,11 +751,17 @@ fn note_display_txn_payload(state: &mut DeviceState, channel_id: u32, packet: &P
     crate::runtime::drain::note_store_route("display_txn_payload_overlong");
     // Latched per (opcode, length): a guest that grew this command grew it for
     // every frame, and the thousandth line says nothing the first did not.
-    if !state
-        .display
-        .txn_payload_samples
-        .insert((packet.opcode, plen))
-    {
+    let display_index = present_display_index(packet.opcode, &packet.payload).unwrap_or(0);
+    // An unadvertised pipe is malformed, but it must not suppress the payload
+    // shape alarm that explains the command. Use the primary pipe's bounded
+    // sample set only as the dedup owner in that case; no routing decision is
+    // inferred from it.
+    let display = if state.display_pipe(display_index).is_some() {
+        state.display_pipe_mut(display_index).unwrap()
+    } else {
+        &mut state.display
+    };
+    if !display.txn_payload_samples.insert((packet.opcode, plen)) {
         return;
     }
     // Bounded, because the length is the guest's. 64 bytes is four times the
@@ -2396,16 +2428,25 @@ fn fill_display_descriptor<H: HostMemory + HostOps>(
 }
 
 /// Sample cursor x/y/show from the display shared-state page (GPA +0xe00).
-fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
-    if state.display.shared_gpa == 0 {
+pub(crate) fn sample_cursor_position_for_display<M: HostMemory>(
+    state: &mut DeviceState,
+    mem: &M,
+    display_index: u32,
+) {
+    let shared_gpa = if display_index == state.display.display_index {
+        state.display.shared_gpa
+    } else {
+        state
+            .additional_displays
+            .get(&display_index)
+            .map_or(0, |display| display.shared_gpa)
+    };
+    if shared_gpa == 0 {
         return;
     }
     let mut pos = [0u8; 4];
     if mem
-        .read_gpa(
-            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_POS,
-            &mut pos,
-        )
+        .read_gpa(shared_gpa + DISPLAY_SHARED_CURSOR_POS, &mut pos)
         .is_err()
     {
         return;
@@ -2419,15 +2460,16 @@ fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
     state.cursor.y = ((packed >> 16) & 0xffff) as u16;
     let mut show = [0u8; 4];
     if mem
-        .read_gpa(
-            state.display.shared_gpa + DISPLAY_SHARED_CURSOR_SHOW,
-            &mut show,
-        )
+        .read_gpa(shared_gpa + DISPLAY_SHARED_CURSOR_SHOW, &mut show)
         .is_ok()
     {
         // Guest may only write a byte; treat non-zero low byte as show.
         state.cursor.show = show[0] != 0 || ld32(&show) != 0;
     }
+}
+
+fn sample_cursor_position<M: HostMemory>(state: &mut DeviceState, mem: &M) {
+    sample_cursor_position_for_display(state, mem, state.display.display_index);
 }
 
 /// Load CmdDisplayCursorGlyph pixels (BGRA guest → ARGB QEMUCursor).
@@ -2706,6 +2748,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
     channel_id: u32,
+    display_index: u32,
     mapping: u32,
 ) -> ChildPacketDisposition {
     if mapping == 0 {
@@ -2729,7 +2772,18 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         channel_id
     };
     drain_other_child_fifos(state, host, skip);
+    if state.pending.host_action_yield {
+        // Another display pipe presented while the rescue froze this packet's
+        // render dependencies. Its frame now occupies the shared capture
+        // workspace and must cross the worker→window boundary before this
+        // packet may replace it. Leave this packet at its channel head; the
+        // next tranche retries it after the nested output has published.
+        return ChildPacketDisposition::Deferred;
+    }
     drain_other_child_fifos(state, host, skip);
+    if state.pending.host_action_yield {
+        return ChildPacketDisposition::Deferred;
+    }
     // Main-ring Dekker only (not full drain_stranded): guest may
     // publish root control work while child drains ran. Full
     // drain_stranded re-enters this child channel and wedged iBoot
@@ -2744,7 +2798,17 @@ fn present_named_mapping<H: HostMemory + HostOps>(
         drain_main_fifo(state, host);
         // Body-layer child work may be doorbell'd from main packets.
         drain_other_child_fifos(state, host, skip);
+        if state.pending.host_action_yield {
+            return ChildPacketDisposition::Deferred;
+        }
     }
+
+    // The rescue drains above may process a present from another display pipe
+    // recursively. Reassert this packet's owner after them: the finished frame
+    // exported at the worker boundary belongs to the outer packet, not to the
+    // last nested display transaction that happened to run while freezing its
+    // render dependencies.
+    state.present_display_index = display_index;
 
     // Preflight translation keeps an EXEC packet at its channel head. If one
     // is still held after all rescue drains, accepting this display packet
@@ -2979,7 +3043,7 @@ fn present_named_mapping<H: HostMemory + HostOps>(
     // PGDisplay completion block runs for every present after the
     // +0x188 retain (also when geometry held the paint): display
     // shared-page present bit + conditional display IRQ.
-    signal_display_present_complete(state, host);
+    signal_display_present_complete(state, host, display_index);
     ChildPacketDisposition::Complete
 }
 
@@ -3114,9 +3178,8 @@ fn apply_map_family<H: HostMemory + HostOps>(
                 "bb_retire_map_range",
                 state.retire_bound_buffers_in_range(task_id, gva, length),
             );
-            let n = crate::runtime::gva_view::retire_gva_views_overlapping(
-                state, task_id, gva, length,
-            );
+            let n =
+                crate::runtime::gva_view::retire_gva_views_overlapping(state, task_id, gva, length);
             let op = if family == MapFamily::UnmapMemory {
                 "unmap_memory"
             } else {
@@ -3256,12 +3319,9 @@ fn apply_map_family<H: HostMemory + HostOps>(
             // host-cached pixels for a resource the guest has just
             // CPU-written, so the line has to say which check refused
             // and not only that one did.
-            Err(e) => note_resource_list_decode_fail(
-                "InvalidateResources",
-                packet.opcode,
-                channel_id,
-                e,
-            ),
+            Err(e) => {
+                note_resource_list_decode_fail("InvalidateResources", packet.opcode, channel_id, e)
+            }
         }
     } else if matches!(
         family,
@@ -3346,7 +3406,6 @@ fn apply_map_family<H: HostMemory + HostOps>(
         ));
     }
 }
-
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChildPacketDisposition {
@@ -3445,7 +3504,17 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_setup_shared_state(state, host, &packet.payload, Some(channel_id));
         }
         CHILD_OP_ONLINE_ACK => {
-            state.display.online_acked = true;
+            let Some(display_index) = state.display_pipe_for_channel(channel_id) else {
+                crate::observe::fail(format!(
+                    "display_online_ack_unregistered ch={channel_id} plen={}",
+                    packet.payload.len()
+                ));
+                return ChildPacketDisposition::Complete;
+            };
+            let Some(display) = state.display_pipe_mut(display_index) else {
+                return ChildPacketDisposition::Complete;
+            };
+            display.online_acked = true;
             // The connectionChange-ack (process_online opcode 2) is believed to
             // echo the shared-descriptor `+0x200` token back to the host in its
             // payload. We consume the ack (online_acked)
@@ -3464,7 +3533,7 @@ fn process_child_packet<H: HostMemory + HostOps>(
             };
             crate::observe::fail(format!(
                 "display_online_ack index={} plen={} w0={:#x} w1={:#x}",
-                state.display.display_index,
+                display.display_index,
                 packet.payload.len(),
                 w0,
                 w1
@@ -3486,8 +3555,26 @@ fn process_child_packet<H: HostMemory + HostOps>(
         // op6 `CmdDisplayTransaction2_DEPRECATED` and op7
         // `CmdDisplayTransaction3`. They differ only in where the surface word
         // sits, which `display_txn_trailer_slots` owns for all three.
-        opcode @ (CHILD_OP_DISPLAY_SWAP | CHILD_OP_DISPLAY_TRANSACTION2 | CHILD_OP_DISPLAY_TRANSACTION3) => {
+        opcode @ (CHILD_OP_DISPLAY_SWAP
+        | CHILD_OP_DISPLAY_TRANSACTION2
+        | CHILD_OP_DISPLAY_TRANSACTION3) => {
             note_display_txn_payload(state, channel_id, packet);
+            let Some(display_index) = present_display_index(opcode, &packet.payload) else {
+                crate::observe::fail(format!(
+                    "packet_short reason=display_present_short ch={channel_id} op={opcode:#x} \
+                     plen={} need={}",
+                    packet.payload.len(),
+                    display_txn_trailer_len(opcode)
+                ));
+                return ChildPacketDisposition::Complete;
+            };
+            if state.display_pipe(display_index).is_none() {
+                crate::observe::fail(format!(
+                    "display_present_unadvertised index={display_index} ports={} ch={channel_id} op={opcode:#x}",
+                    state.display_port_count
+                ));
+                return ChildPacketDisposition::Complete;
+            }
             let Some(mapping) = present_surface_id(opcode, &packet.payload) else {
                 crate::observe::fail(format!(
                     "packet_short reason=display_present_short ch={channel_id} op={opcode:#x} \
@@ -3511,12 +3598,12 @@ fn process_child_packet<H: HostMemory + HostOps>(
             crate::observe::line(format!(
                 "present_txn op={opcode:#x} ch={channel_id} pipe={} sid={mapping} task={task} \
                  plen={} unpainted={} prior_present_mapping={}",
-                ld32(&packet.payload[0..]),
+                display_index,
                 packet.payload.len(),
                 state.present.unpainted_presents,
                 state.present.present_mapping
             ));
-            if present_named_mapping(state, host, channel_id, mapping)
+            if present_named_mapping(state, host, channel_id, display_index, mapping)
                 == ChildPacketDisposition::Deferred
             {
                 return ChildPacketDisposition::Deferred;
@@ -3749,10 +3836,22 @@ fn process_child_packet<H: HostMemory + HostOps>(
             apply_map_family(state, host, channel_id, packet, MapFamily::MapMemory2);
         }
         CHILD_OP_INVALIDATE_RESOURCES => {
-            apply_map_family(state, host, channel_id, packet, MapFamily::InvalidateResources);
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::InvalidateResources,
+            );
         }
         CHILD_OP_SYNCHRONIZE_RESOURCES => {
-            apply_map_family(state, host, channel_id, packet, MapFamily::SynchronizeResources);
+            apply_map_family(
+                state,
+                host,
+                channel_id,
+                packet,
+                MapFamily::SynchronizeResources,
+            );
         }
         CHILD_OP_SYNCHRONIZE_AND_DISCARD_RESOURCES => {
             apply_map_family(
@@ -4232,8 +4331,14 @@ pub fn drain_iosfc<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut 
 pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
+    display_index: u32,
 ) {
-    let gpa = state.display.shared_gpa;
+    let page_size = state.page_size() as usize;
+    let interrupt_status = Arc::clone(&state.gfx.interrupt_status_disp);
+    let Some(display) = state.display_pipe_mut(display_index) else {
+        return;
+    };
+    let gpa = display.shared_gpa;
     if gpa == 0 {
         return;
     }
@@ -4266,7 +4371,7 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
     // suppresses the intermittent try_display_online/ack race leftover. A fresh
     // legitimate online (after a reinit) clears `online_acked` first, so it is
     // never masked here. Still logged (measure + fix together).
-    let stale = state.display.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
+    let stale = display.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
     let base = if stale {
         pending & !DISPLAY_ONLINE_EVENT_MASK
     } else {
@@ -4277,17 +4382,14 @@ pub fn signal_display_present_complete<H: HostMemory + HostOps>(
         gpa,
         DISPLAY_SHARED_PENDING,
         base | DISPLAY_PRESENT_EVENT_MASK,
-        state.page_size() as usize,
+        page_size,
     );
     if stale {
         crate::runtime::census::present_proxy::note_stale_online_pending("present", pending);
     }
     if mask & DISPLAY_PRESENT_EVENT_MASK != 0 {
-        let bit = 1u32 << (state.display.display_index & 0x1f);
-        state
-            .gfx
-            .interrupt_status_disp
-            .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+        let bit = 1u32 << (display.display_index & 0x1f);
+        interrupt_status.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
         host.enqueue(HostAction::irq_gfx());
     }
 }
@@ -4360,9 +4462,31 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
 pub fn signal_display_vbl<H: HostMemory + HostOps>(
     state: &mut DeviceState,
     host: &mut H,
-    last_us: &std::sync::atomic::AtomicU64,
+    last_us: &[std::sync::atomic::AtomicU64; crate::model::MAX_DISPLAY_PORT_COUNT as usize],
 ) {
-    signal_display_vbl_at(state, host, last_us, crate::observe::elapsed_us());
+    signal_display_vbl_all_at(state, host, last_us, crate::observe::elapsed_us());
+}
+
+fn signal_display_vbl_all_at<H: HostMemory + HostOps>(
+    state: &mut DeviceState,
+    host: &mut H,
+    last_us: &[std::sync::atomic::AtomicU64; crate::model::MAX_DISPLAY_PORT_COUNT as usize],
+    now_us: u64,
+) {
+    let page_size = state.page_size() as usize;
+    let interrupt_status = Arc::clone(&state.gfx.interrupt_status_disp);
+    for index in state.registered_display_pipes() {
+        if let Some(display) = state.display_pipe_mut(index) {
+            signal_display_vbl_pipe_at(
+                display,
+                page_size,
+                &interrupt_status,
+                host,
+                &last_us[index as usize],
+                now_us,
+            );
+        }
+    }
 }
 
 /// The engine's own counters, over the window `drain_duty` just reported.
@@ -4489,8 +4613,29 @@ fn carrier_word(carried: Option<bool>) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn signal_display_vbl_at<H: HostMemory + HostOps>(
     state: &mut DeviceState,
+    host: &mut H,
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
+) {
+    let page_size = state.page_size() as usize;
+    let interrupt_status = Arc::clone(&state.gfx.interrupt_status_disp);
+    signal_display_vbl_pipe_at(
+        &mut state.display,
+        page_size,
+        &interrupt_status,
+        host,
+        last_us,
+        now_us,
+    );
+}
+
+fn signal_display_vbl_pipe_at<H: HostMemory + HostOps>(
+    display: &mut crate::model::DisplayHandshake,
+    page_size: usize,
+    interrupt_status: &std::sync::atomic::AtomicU32,
     host: &mut H,
     last_us: &std::sync::atomic::AtomicU64,
     now_us: u64,
@@ -4499,7 +4644,7 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     // whole milliseconds; the census windows in milliseconds so its `t=` stays
     // on the same scale as every other always-on line.
     let now_ms = now_us / 1_000;
-    if state.display.shared_gpa == 0 || !state.display.online_acked {
+    if display.shared_gpa == 0 || !display.online_acked {
         note_vbl(VBL_NOT_ONLINE, now_ms);
         return;
     }
@@ -4508,7 +4653,7 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         return;
     }
     note_vbl(VBL_DELIVERED, now_ms);
-    let gpa = state.display.shared_gpa;
+    let gpa = display.shared_gpa;
     let mut pending_le = [0u8; 4];
     let pending = if host
         .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
@@ -4522,7 +4667,7 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
     // the guest re-run process_online → connectionChange → overlay rebuild (see
     // signal_display_present_complete). signal_display_vbl only runs post-ack, so
     // online_acked is already true here; `stale` is 0 on healthy boots (no-op).
-    let stale = state.display.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
+    let stale = display.online_acked && pending & DISPLAY_ONLINE_EVENT_MASK != 0;
     let base = if stale {
         pending & !DISPLAY_ONLINE_EVENT_MASK
     } else {
@@ -4533,16 +4678,13 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
         gpa,
         DISPLAY_SHARED_PENDING,
         base | DISPLAY_VBL_EVENT_MASK,
-        state.page_size() as usize,
+        page_size,
     );
     if stale {
         crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
     }
-    let bit = 1u32 << (state.display.display_index & 0x1f);
-    state
-        .gfx
-        .interrupt_status_disp
-        .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    let bit = 1u32 << (display.display_index & 0x1f);
+    interrupt_status.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
     host.enqueue(HostAction::irq_gfx());
 }
 
@@ -4553,10 +4695,25 @@ fn signal_display_vbl_at<H: HostMemory + HostOps>(
 /// `enable()` sets `+0x104` bit 2 — earlier IRQs wedge an unregistered display.
 /// createDisplayAttributes then consumes TimingElements (incl. 1440 mode).
 pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    if state.display.shared_gpa == 0 || state.display.online_acked {
+    let page_size = state.page_size() as usize;
+    let interrupt_status = Arc::clone(&state.gfx.interrupt_status_disp);
+    for index in state.registered_display_pipes() {
+        if let Some(display) = state.display_pipe_mut(index) {
+            try_display_online_pipe(display, page_size, &interrupt_status, host);
+        }
+    }
+}
+
+fn try_display_online_pipe<H: HostMemory + HostOps>(
+    display: &mut crate::model::DisplayHandshake,
+    page_size: usize,
+    interrupt_status: &std::sync::atomic::AtomicU32,
+    host: &mut H,
+) {
+    if display.shared_gpa == 0 || display.online_acked {
         return;
     }
-    if state.display.online_tries >= DISPLAY_ONLINE_MAX_TRIES {
+    if display.online_tries >= DISPLAY_ONLINE_MAX_TRIES {
         // Reaching the cap means this device has stopped asserting ONLINE for
         // this shared-state generation. The desktop the user is waiting for is
         // not coming — with, until this line, nothing in the log to say so. A
@@ -4582,28 +4739,26 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         // be a ~5 Hz flood of the same fact. `display_online_signal` fires on
         // the *first* pulse of the same generation, so that line always precedes
         // this one and the pair brackets the whole handshake.
-        if crate::observe::first_sight(
-            "display_online_abandoned",
-            u64::from(state.display.display_index),
-        ) {
+        if crate::observe::first_sight("display_online_abandoned", u64::from(display.display_index))
+        {
             crate::observe::fail(format!(
                 "display_online_abandoned index={} tries={DISPLAY_ONLINE_MAX_TRIES} \
                  divisor={DISPLAY_ONLINE_POLL_DIVISOR} \
                  (the guest enabled the display and acked none of the ONLINE \
                  pulses; no more are sent until a setupSharedState reinit)",
-                state.display.display_index
+                display.display_index
             ));
         }
         return;
     }
     // Cadence: skip most ticks (archive divisor); still run often enough via
     // gfx_update / drain that enable() is observed within seconds.
-    let ctr = state.display.poll_ctr.wrapping_add(1);
-    state.display.poll_ctr = ctr;
+    let ctr = display.poll_ctr.wrapping_add(1);
+    display.poll_ctr = ctr;
     if !ctr.is_multiple_of(DISPLAY_ONLINE_POLL_DIVISOR) {
         return;
     }
-    let gpa = state.display.shared_gpa;
+    let gpa = display.shared_gpa;
     let mut mask_le = [0u8; 4];
     if host
         .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
@@ -4651,19 +4806,19 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         // `MAX_TRIES` pulses at one per `DIVISOR` ticks, so no new number is
         // introduced and the two halves of the handshake time out alike.
         let waited = u64::from(DISPLAY_ONLINE_MAX_TRIES) * u64::from(DISPLAY_ONLINE_POLL_DIVISOR);
-        if u64::from(state.display.poll_ctr) > waited
+        if u64::from(display.poll_ctr) > waited
             && crate::observe::first_sight(
                 "display_online_never_enabled",
-                u64::from(state.display.display_index),
+                u64::from(display.display_index),
             )
         {
             crate::observe::fail(format!(
                 "display_online_never_enabled index={} gpa={:#x} mask={mask:#x} polls={} \
                  (the guest published the display shared page and has not set the \
                  enable bit; ONLINE has never been asserted and the poll continues)",
-                state.display.display_index,
+                display.display_index,
                 gpa + DISPLAY_SHARED_ENABLE_MASK,
-                state.display.poll_ctr,
+                display.poll_ctr,
             ));
         }
         return;
@@ -4674,25 +4829,22 @@ pub fn try_display_online<H: HostMemory + HostOps>(state: &mut DeviceState, host
         gpa,
         DISPLAY_SHARED_PENDING,
         DISPLAY_ONLINE_EVENT_MASK,
-        state.page_size() as usize,
+        page_size,
     );
-    let bit = 1u32 << (state.display.display_index & 0x1f);
-    state
-        .gfx
-        .interrupt_status_disp
-        .fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
+    let bit = 1u32 << (display.display_index & 0x1f);
+    interrupt_status.fetch_or(bit, std::sync::atomic::Ordering::AcqRel);
     host.enqueue(HostAction::irq_gfx());
     // Always-on on the first ONLINE pulse per shared-state generation (rare, not a
     // flood): the display-lifecycle timeline entry point. A second pass through here
     // after a reinit setup pairs with display_shared_state_setup reinit=1 to show a
     // post-converge display rebuild.
-    if state.display.online_tries == 0 {
+    if display.online_tries == 0 {
         crate::observe::fail(format!(
             "display_online_signal index={}",
-            state.display.display_index
+            display.display_index
         ));
     }
-    state.display.online_tries = state.display.online_tries.saturating_add(1);
+    display.online_tries = display.online_tries.saturating_add(1);
 }
 
 /// Drain active/pending child FIFOs other than channels mid-drain.
