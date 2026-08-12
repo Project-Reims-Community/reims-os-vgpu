@@ -2189,6 +2189,11 @@ fn a_guest_that_never_enables_cannot_reach_the_online_cap() {
 /// - `not_online` and `not_claimed` stay separate, because "the display never
 ///   came up" and "the 8 ms limiter is working correctly at 125 Hz" are opposite
 ///   conclusions from the same low delivered count.
+///
+/// The head of each arm reports at the finer `VBL_REPORT_EARLY` cadence, so the
+/// first assertion below counts sixteen lines rather than one. Both cadences
+/// measure the window they cover, which is what keeps the rate comparable across
+/// the boundary between them.
 #[test]
 fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
     use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_CLAIMED, VBL_NOT_ONLINE};
@@ -2200,20 +2205,23 @@ fn the_vbl_census_reports_window_rate_and_separates_the_silent_arms() {
         assert!(c.note(VBL_NOT_CLAIMED, i).is_none());
     }
 
-    // 1024 deliveries at the 8 ms grid: one report, and the rate is the grid.
+    // 1024 deliveries at the 8 ms grid. The head of an arm reports every 64 so
+    // the display-link latch window is visible at all, so that is 16 lines, and
+    // each covers 64 deliveries over 512 ms — still the grid rate, because the
+    // window and the step are the same quantity.
     let mut lines = Vec::new();
     for i in 1..=1024u64 {
         if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
             lines.push(l);
         }
     }
-    assert_eq!(lines.len(), 1, "exactly one report per 1024 deliveries");
-    let line = &lines[0];
-    assert!(line.contains("delivered=1024"), "{line}");
+    assert_eq!(lines.len(), 16, "one report per 64 deliveries over the head");
     assert!(
-        line.contains("window_hz=125.0"),
-        "1024 deliveries spanning 8192 ms is 125 Hz: {line}"
+        lines.iter().all(|l| l.contains("window_hz=125.0")),
+        "every early window is 64 deliveries over 512 ms: {lines:?}"
     );
+    let line = lines.last().expect("the head reports");
+    assert!(line.contains("delivered=1024"), "{line}");
     assert!(
         line.contains("not_online=5000") && line.contains("not_claimed=5000"),
         "the silent arms must stay separable and counted: {line}"
@@ -3279,6 +3287,53 @@ fn a_continuously_armed_guest_is_still_capped_at_the_advertised_rate() {
         delivered >= grid - 1,
         "delivered {delivered} falls short of the grid {grid}"
     );
+}
+
+/// Both reporting arms measure their own window, and neither resets the other's.
+///
+/// A guest that arms VBL one shot at a time keeps `delivered` and `not_enabled`
+/// both live, so both report — and they shared one `last_report` pair, which made
+/// every window wrong precisely on the boots worth reading. The symptom in a real
+/// log is `window_hz=0.0`: an arm reaching its own 1024 subtracted the other
+/// arm's 1024 and got a zero-length count.
+#[test]
+fn the_two_reporting_vbl_arms_do_not_share_one_window() {
+    use crate::runtime::drain::{VblCensus, VBL_DELIVERED, VBL_NOT_ENABLED};
+    let c = VblCensus::default();
+
+    // A one-shot guest takes both arms on the same timeline — a tick either
+    // found it armed or did not — so both cross 1024 over one 8 ms grid and both
+    // report at the same instant. Each is 1024 events over its own 8192 ms, so
+    // both lines must read 125 Hz; with one shared pair whichever reports second
+    // subtracts the first's count and prints the `window_hz=0.0` that a real
+    // driven boot is full of.
+    let mut served = None;
+    let mut declined = None;
+    for i in 1..=1024u64 {
+        if let Some(l) = c.note(VBL_DELIVERED, i * 8) {
+            served = Some(l);
+        }
+        if let Some(l) = c.note(VBL_NOT_ENABLED, i * 8) {
+            declined = Some(l);
+        }
+    }
+    for (line, arm) in [
+        (served.expect("delivered reports at its own 1024"), "delivered"),
+        (
+            declined.expect("not_enabled reports at its own 1024"),
+            "not_enabled",
+        ),
+    ] {
+        assert!(line.contains(&format!("arm={arm}")), "{line}");
+        assert!(
+            !line.contains("window_hz=0.0"),
+            "{arm} had the other arm's count subtracted from it: {line}"
+        );
+        assert!(
+            line.contains("window_hz=125.0"),
+            "{arm} saw 1024 events over 8192 ms, which is 125 Hz: {line}"
+        );
+    }
 }
 
 /// After online is acked, a stale ONLINE bit (bit2) left in pending is

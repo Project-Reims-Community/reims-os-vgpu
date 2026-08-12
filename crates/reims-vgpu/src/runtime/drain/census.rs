@@ -50,15 +50,237 @@ pub(crate) const VBL_NOT_ENABLED: usize = 3;
 /// One report per this many deliveries — about 8 s at the grid rate.
 const VBL_REPORT_EVERY: u64 = 1024;
 
+/// One report per this many deliveries, for an arm's first
+/// [`VBL_EARLY_UNTIL`] — about half a second at the grid rate.
+///
+/// # The window this exists to make visible
+///
+/// A macOS 13 guest latches its display link at either ~60 Hz or ~120 Hz within
+/// the first seconds of the display coming up, and then holds it for the life of
+/// the boot. Which one it picks varies boot to boot on a byte-identical device,
+/// and it is worth a **factor of two** in presented frames, draws and every
+/// per-second reading taken off them — far more than any rail this device has
+/// been tuned on.
+///
+/// At [`VBL_REPORT_EVERY`] the first line of a boot lands after about eleven
+/// seconds, which is long after the guest has decided. So the cadence during the
+/// window that decides it was simply not observable, and no amount of reading
+/// later lines could recover it. Sixteen finer lines at the head of each arm cost
+/// nothing and cover the first ~9 s.
+///
+/// # What it found, and the false positive it found first
+///
+/// Boots on this rail are sharply bimodal: over 40 interleaved driven macos-13
+/// boots, 28 presented 94.8-117.0 frames a second and 12 presented 59.8-60.5,
+/// with nothing in between. Roughly three in ten lose half their frame rate.
+///
+/// The first reading off this instrument was that the **first sustained
+/// `arm=delivered` window** — the guest's first stretch of holding VBL armed,
+/// landing near `delivered=128` — predicted which population a boot fell into,
+/// 8 times out of 8. **It does not.** That run contained exactly one slow boot,
+/// so every feature of that one boot "predicted" the outcome perfectly. Twenty
+/// instrumented boots later:
+///
+/// ```text
+/// boots   first sustained window   latched
+///  B8,B9,B12,B16   119.6 - 120.3     slow
+///  B7                    44.1        fast
+///  the other 15     119.4 - 120.5    fast
+/// ```
+///
+/// Four slow boots were served a clean ~120 Hz across that window and latched 60
+/// anyway, and one boot served 44 Hz latched fast. The window is ~120 Hz in 18
+/// of 20 boots whatever happens afterwards, so it carries no signal at all.
+///
+/// **Treat a single-slow-boot sample as no sample.** The population that matters
+/// here shows up in 30 % of boots, so a run of eight contains one or two of them
+/// and cannot separate a cause from a coincidence. Forty boots is the order of
+/// sample size this question needs, and the same trap applies to any other
+/// feature someone thinks distinguishes the two.
+///
+/// What every boot does share is the shape: two windows at ~120 Hz, a dip, a
+/// quiet stretch of ten seconds or more while the desktop comes up, then a ramp.
+/// The populations diverge only in where that ramp settles — fast boots at
+/// 110-120 Hz delivered, slow boots at 75-90 — and that is the outcome rather
+/// than a cause, because a 60 Hz compositor arms VBL less often by construction.
+/// A slow boot is not being starved of VBL when it settles: it receives ~85 a
+/// second and presents 60.
+///
+/// # It is not a frame-time cliff either
+///
+/// A guest holding a 120 Hz link that presents either ~120 or exactly ~60 is the
+/// signature of vsync-locked halving: miss the 8.33 ms budget and you fall to
+/// every other vblank. If that were it, this device would be sitting on the edge
+/// of the threshold, and every microsecond saved anywhere would buy a
+/// *probability* of doubling the frame rate — which would be the most important
+/// fact in this crate.
+///
+/// It is not it. Twenty-four interleaved boots, with the device deliberately
+/// pushed the wrong way by `REIMS_VGPU_COMPUTE_GATHER=off` (about 20 % more GPU
+/// work per draw, and the arm's positive control confirmed
+/// `buffer_gather_dispatches=0`):
+///
+/// ```text
+/// arm                       fast   slow
+/// ~20 % slower device         10      2
+/// shipping default             5      7
+/// ```
+///
+/// Making the device slower did not push boots over a cliff; the slower arm
+/// latched fast *more* often. Whatever direction that effect is (p≈0.09, and one
+/// interleaved run of twelve an arm is not enough to claim it), it rules out the
+/// cliff, which predicted the opposite and predicted it strongly.
+///
+/// # Nor is it the host GPU's clock
+///
+/// The direction above pointed at the governor: this part idles at 180 MHz
+/// against a 3090 MHz cap, so "more GPU work" plausibly means "higher clock"
+/// means "lower latency for everything the guest waits on". Sixteen boots with
+/// `nvidia-smi` sampled at 2 Hz throughout, split at the 25 s mark so the window
+/// *before* the guest has latched is read separately from the driven one:
+///
+/// ```text
+///        early (0-25 s)          driven (25 s-end)
+///        med MHz   p90   util    med MHz   util
+/// fast     1040   1590    24 %     1547    31 %
+/// slow     1044   1594    26 %     1266    24 %
+/// ```
+///
+/// The early window is **identical**. The driven window differs, and that is the
+/// causality running backwards rather than a cause: a guest presenting 60 frames
+/// a second asks for half the work and so clocks lower by construction. Reading
+/// the driven column alone would have produced a confident wrong answer, which
+/// is why the run split the windows before scoring.
+///
+/// # The cause: the compositor is paced by a constant the guest cannot correct
+///
+/// It is not the VBL rate at all, which is why six device-side hypotheses in a
+/// row came back null. The contract, and then the live confirmation:
+///
+/// 1. The guest's compositor schedules each frame on a timer at
+///    `lastVBL + period`. Nothing in it measures VBL arrivals, divides a rate or
+///    counts missed frames; `period` is taken verbatim from the kernel.
+/// 2. The kernel display-pipe layer ships `(lastVBL, lastVBL + fRefreshPeriod)`
+///    on every VBL notification, so `period` **is** `fRefreshPeriod`.
+/// 3. `fRefreshPeriod` is written in one place, on display-mode change. It is
+///    initialised to a synthesised **1/60 s = 16 666 666 ns** and only then
+///    replaced by the true value, `IOFBCurrentPixelCount * 1e9 /
+///    IOFBCurrentPixelClock`. Five early returns leave the 60 Hz default standing.
+/// 4. Those two `IOFramebuffer` properties are published only when the mode's
+///    detailed timing is marked valid, and the paravirtual framebuffer driver
+///    clears that valid bit and fills the timing with nothing — so the
+///    framebuffer layer *removes* both properties.
+///
+/// Confirmed live rather than argued: over eleven driven macos-13 boots `ioreg`
+/// finds **neither property on any boot** — not on the 59.5-60.1 Hz ones and not
+/// on the 97.5-114.3 Hz ones. The numbers are not even hard to come by; the same
+/// dump carries the detailed timing the guest built out of our table (pixel clock
+/// 15 848 840 000 Hz, 1920 + 10 000 by 1080 + 10 000), which works out to
+/// 8 333 332 ns — 120.00 Hz to five figures. The guest holds the inputs and the
+/// path that would use them is closed.
+///
+/// # Which of two values a boot latches is the whole split
+///
+/// `fRefreshPeriod` is never recomputed once set, so a boot ends on one of two:
+///
+/// - **16 666 666 ns** — the compositor paces on it and produces **exactly 60 Hz**.
+/// - **0**, when the first notification is sent before the mode-change path has
+///   run. A zero period puts the next wake time in the past, so the compositor
+///   **free-runs** and produces whatever it can, work-limited.
+///
+/// The measured populations are that fingerprint and nothing else: every slow
+/// boot on record sits in 59.5-60.5 Hz, a *constant*, and every fast one in
+/// 94.8-117.0 Hz, a *spread of twenty-two Hz*. A paced compositor cannot vary
+/// that much and a free-running one cannot be that flat.
+///
+/// So the fast boots are the ones where the guest never learned a period, and the
+/// correctly-configured outcome on this pathway is the *slow* one. State that
+/// before trying to fix it: forcing a second mode change — the obvious lever, and
+/// one this device owns through an offline/online cycle — would set
+/// `fRefreshPeriod` on every boot and take the good 70 % down to 60 Hz.
+///
+/// # "Work-limited" is measured, and it makes the frame rate this device's score
+///
+/// The free-running branch above is the useful one to optimise against, because
+/// *work-limited* there is a measured claim rather than a reading of the code.
+/// The twenty-four-boot run whose latch result appears above also moved this
+/// device's per-draw cost by a known amount, so scoring its **fast boots only**
+/// says what a per-draw saving is worth in frames:
+///
+/// ```text
+/// arm                          n fast   present_hz mean (range)   us/draw mean (range)
+/// shipping                          5   113.2  (109.8-116.3)      13.21  (12.66-14.02)
+/// 20.6 % more GPU work per draw     9   105.5  (101.4-107.7)      15.07  (13.92-16.16)
+/// ```
+///
+/// The frame rates are **disjoint** — the slowest shipping boot beats the fastest
+/// slowed one — while `us/draw` overlaps across the same fourteen boots. Two
+/// things follow, and the second is the one that changes what to do:
+///
+/// - a free-running guest converts device work into frames at roughly **0.35
+///   frames per unit of per-draw GPU work**, so a candidate worth under ~5 % per
+///   draw is not worth a boot chain here;
+/// - `present_hz` over the fast population is a *sharper* instrument than
+///   `us/draw`, not a noisier one, and it is the number to rank a change by.
+///
+/// That also settles the standing puzzle of per-draw wins that "bought no
+/// frames": they were measured through a presenter that clamped at ~41 Hz. It
+/// does not clamp now, and the frames are there.
+///
+/// # What this closes
+///
+/// Not the limiter (~118 Hz on every boot, fast or slow), not the claim ordering
+/// (40 interleaved boots, p≈0.7, see [`super::signal_display_refresh_classes`]),
+/// not the display mode (see [`super::fill_display_descriptor`]; both populations
+/// report 120.00 Hz), not the early delivery window, not a frame-time threshold,
+/// and not the host GPU clock. All six were null for one reason: each was about
+/// how fast this device delivers VBL, and the guest's frame period is not derived
+/// from that.
+///
+/// One methodological result came out of the same runs and belongs to anyone
+/// testing the next theory: the base rate **drifts**. It was 12 slow in 40 early
+/// in a session and 7 in 12 twice, hours later, on the same binary. Compare arms
+/// only within one interleaved run.
+///
+/// This is an instrument, not a rail: nothing branches on it.
+const VBL_REPORT_EARLY: u64 = 64;
+
+/// How far into an arm's count the finer [`VBL_REPORT_EARLY`] cadence runs.
+///
+/// Equal to [`VBL_REPORT_EVERY`] so the two cadences meet exactly at the
+/// boundary: the last early report and the first ordinary one are the same
+/// event, and no window is ever measured across a change of step.
+const VBL_EARLY_UNTIL: u64 = VBL_REPORT_EVERY;
+const _: () = assert!(VBL_EARLY_UNTIL.is_multiple_of(VBL_REPORT_EARLY));
+
 /// Width of [`VblCensus::arms`], derived from the last arm index so a new arm
 /// cannot be added without the array growing with it.
 const VBL_ARMS: usize = VBL_NOT_ENABLED + 1;
 
+/// # `window_hz` is per reporting arm, and used not to be
+///
+/// Two arms report — `delivered` and `not_enabled` — and they shared one
+/// `last_report_ms`/`last_report_n` pair. Whenever both were live in the same
+/// boot the shared counter made every window wrong: an arm reporting at its own
+/// `n = 1024` subtracted the *other* arm's 1024 and printed `window_hz=0.0`, and
+/// the next report measured its count against a timestamp the other arm had
+/// moved. A boot alternating the two produced a column of zeroes and a column of
+/// rates over windows that never happened.
+///
+/// That is not a cosmetic log defect. `window_hz` is the only per-window reading
+/// of the rate the guest's compositor is paced at, and it read as broken exactly
+/// on the boots worth reading — a guest that arms VBL one shot at a time is the
+/// guest that makes both arms report. The delivered rate had to be recovered by
+/// differencing consecutive `delivered=` fields across lines instead.
+///
+/// So the window is per arm. `since_n` went with the fix rather than being
+/// repaired: an arm reports on every multiple of [`VBL_REPORT_EVERY`] of its own
+/// count and then stores that count, so the gap is always exactly
+/// `VBL_REPORT_EVERY` and computing it was the thing that could be wrong.
 #[derive(Default)]
 pub(crate) struct VblCensus {
     arms: [std::sync::atomic::AtomicU64; VBL_ARMS],
-    last_report_ms: std::sync::atomic::AtomicU64,
-    last_report_n: std::sync::atomic::AtomicU64,
+    last_report_ms: [std::sync::atomic::AtomicU64; VBL_ARMS],
 }
 
 impl VblCensus {
@@ -85,16 +307,26 @@ impl VblCensus {
         use std::sync::atomic::Ordering::Relaxed;
         let n = self.arms[arm].fetch_add(1, Relaxed) + 1;
         let reports = arm == VBL_DELIVERED || arm == VBL_NOT_ENABLED;
-        if !reports || !n.is_multiple_of(VBL_REPORT_EVERY) {
+        // The head of each arm reports finely, because that is the window in
+        // which the guest picks the display-link rate it then keeps; see
+        // `VBL_REPORT_EARLY`. The two cadences meet at `VBL_EARLY_UNTIL`, so
+        // `step` is also exactly how many events this window covers.
+        let step = if n <= VBL_EARLY_UNTIL {
+            VBL_REPORT_EARLY
+        } else {
+            VBL_REPORT_EVERY
+        };
+        if !reports || !n.is_multiple_of(step) {
             return None;
         }
-        let since_ms = now_ms.saturating_sub(self.last_report_ms.swap(now_ms, Relaxed));
-        let since_n = n.saturating_sub(self.last_report_n.swap(n, Relaxed));
+        let since_ms = now_ms.saturating_sub(self.last_report_ms[arm].swap(now_ms, Relaxed));
         // Window rate, not a lifetime average: the lifetime figure carries the
         // pre-online stretch forever and would read low long after the display
-        // came up.
+        // came up. The count in the window is `step` by construction — this line
+        // exists because this arm's own count just reached a multiple of it — so
+        // the only variable is how long that took.
         let hz = if since_ms > 0 {
-            (since_n * 1000) as f64 / since_ms as f64
+            (step * 1000) as f64 / since_ms as f64
         } else {
             0.0
         };
@@ -120,6 +352,41 @@ pub(crate) fn note_vbl(arm: usize, now_ms: u64) {
     if let Some(line) = VBL.note(arm, now_ms) {
         crate::observe::off(line);
     }
+}
+
+/// One interrupt pulse dropped because an undelivered pulse of the same kind
+/// was still queued.
+///
+/// # Why a coalesced pulse is not the same as a delivered one
+///
+/// The prompt queue in `qemu::host_ops` collapses a second pulse of a kind into
+/// the first while the first is still waiting for QEMU's bottom half. For a
+/// status the guest reads back that is free — the status bits accumulate, so one
+/// interrupt carries both. **For VBL it is not free**, because the guest does not
+/// read a count, it reads a clock: it timestamps the vblank it is told about, and
+/// the interval it measures between two of them is what its compositor uses as
+/// its frame period. A vblank folded into another one is a vblank that never
+/// happened as far as the guest is concerned, and the interval it measures is
+/// then two grid periods instead of one.
+///
+/// So this counter and `display_vbl`'s `delivered` count different things and
+/// must not be read as one. `delivered` counts what **this device wrote**; the
+/// guest receives `delivered` minus the pulses counted here. A boot can report a
+/// healthy ~118 Hz delivered rate while the guest is being told about half of it,
+/// and every census in this crate would still read clean — which is why the two
+/// boot populations looked identical from the device side for as long as they
+/// did.
+///
+/// Counted, not refused: coalescing is still the right behaviour for the IOSFC
+/// pulse and for a backlog this device cannot help. The reading is what says
+/// whether it is happening on the VBL rail often enough to matter, and it is per
+/// kind so the two rails cannot be confused for one another.
+pub(crate) fn note_irq_coalesced(kind: crate::runtime::host::HostActionKind) {
+    let name = match kind {
+        crate::runtime::host::HostActionKind::IrqGfxPulse => "irq_coalesced_gfx",
+        _ => "irq_coalesced_iosfc",
+    };
+    crate::runtime::drain::note_store_route(name);
 }
 
 /// Which way the display present/transaction signal went. Indices into the
@@ -2398,89 +2665,14 @@ fn emit_engine_delta() {
     };
     let d = now.delta_since(&prev.unwrap_or_default());
     *prev = Some(now);
-    crate::observe::off(format!(
-        "engine_delta creates={} allocs={} batch_opens={} batch_joins={} batch_flushes={} \
-         batch_flush_draws={} batch_readback_joins={} readbacks={} readback_bytes={} render_post_wait_skips={} \
-         target_reads={} target_read_bytes={} gpu_stamps={} pipeline_misses={} \
-         shader_misses={} shader_hits={} shader_digest_hits={} shader_hash_words={} \
-         pass_misses={} layout_misses={} sampler_misses={} \
-         sampled_cache_hits={} sampled_identity_hits={} sampled_cache_hit_bytes={} \
-         sampled_cache_misses={} sampled_reuploads={} \
-         sampled_reupload_bytes={} sampled_gathers={} sampled_gather_bytes={} \
-         sampled_gather_skips={} sampled_gather_skip_bytes={} \
-         sampled_guest_imports={} sampled_guest_import_bytes={} \
-         sampled_gather_unvouched={} sampled_gather_unretained={} \
-         draw_cover_full={} draw_cover_loaded_full_scissor={} \
-         draw_cover_loaded_partial_scissor={} \
-         buffer_guest_imports={} buffer_guest_import_bytes={} \
-         buffer_guest_gathers={} buffer_guest_gather_bytes={} \
-         buffer_guest_gather_regions={} \
-         buffer_gather_dispatches={} buffer_gather_declined={} \
-         buffer_bind_reuses={} \
-         buffer_snapshot_binds={} \
-         guest_write_linear={} guest_write_rects={} guest_write_regions={} \
-         guest_write_dispatches={} guest_write_scatter_declined={} \
-         seed_uploads={} seed_upload_bytes={} \
-         ring_retire_blocks={} target_evicts={} desc_pool_grow={} gen_mismatch={}",
-        d.creates,
-        d.allocs,
-        d.batch_opens,
-        d.batch_joins,
-        d.batch_flushes,
-        d.batch_flush_draws,
-        d.batch_readback_joins,
-        d.readbacks,
-        d.readback_bytes,
-        d.render_post_wait_skips,
-        d.target_reads,
-        d.target_read_bytes,
-        d.gpu_stamps,
-        d.pipeline_misses,
-        d.shader_misses,
-        d.shader_hits,
-        d.shader_digest_hits,
-        d.shader_hash_words,
-        d.pass_misses,
-        d.layout_misses,
-        d.sampler_misses,
-        d.sampled_cache_hits,
-        d.sampled_identity_hits,
-        d.sampled_cache_hit_bytes,
-        d.sampled_cache_misses,
-        d.sampled_reuploads,
-        d.sampled_reupload_bytes,
-        d.sampled_gathers,
-        d.sampled_gather_bytes,
-        d.sampled_gather_skips,
-        d.sampled_gather_skip_bytes,
-        d.sampled_guest_imports,
-        d.sampled_guest_import_bytes,
-        d.sampled_gather_unvouched,
-        d.sampled_gather_unretained,
-        d.draw_cover_full,
-        d.draw_cover_loaded_full_scissor,
-        d.draw_cover_loaded_partial_scissor,
-        d.buffer_guest_imports,
-        d.buffer_guest_import_bytes,
-        d.buffer_guest_gathers,
-        d.buffer_guest_gather_bytes,
-        d.buffer_guest_gather_regions,
-        d.buffer_gather_dispatches,
-        d.buffer_gather_declined,
-        d.buffer_bind_reuses,
-        d.buffer_snapshot_binds,
-        d.guest_write_linear,
-        d.guest_write_rects,
-        d.guest_write_regions,
-        d.guest_write_dispatches,
-        d.guest_write_scatter_declined,
-        d.seed_uploads,
-        d.seed_upload_bytes,
-        d.ring_retire_blocks,
-        d.target_evicts,
-        d.desc_pool_grow,
-        d.gen_mismatch,
-    ));
+    // Generated from the counter vocabulary rather than named here, so this line
+    // cannot fall behind it again; see `CounterSnapshot::delta_fields`.
+    let mut line = String::from("engine_delta");
+    for (name, value) in d.delta_fields() {
+        use std::fmt::Write as _;
+        let _ = write!(line, " {name}={value}");
+    }
+    crate::observe::off(line);
     emit_registry_pressure(&now);
     emit_draw_phase();
 }

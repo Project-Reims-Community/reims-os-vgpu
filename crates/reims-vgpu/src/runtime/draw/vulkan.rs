@@ -5332,11 +5332,14 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
     crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Binds);
     crate::runtime::bind_phase::note_bind();
 
-    // SPIR-V words for the engine, shared from the translation cache (Arc — no
-    // per-draw materialization; fragment reloc variants are cached per shader).
-    let v_words = v_shader.words.clone();
+    // The two modules in the numbering this draw will use, from the translation
+    // cache. Each carries the walks of its own numbering beside it — see
+    // `m2v_cache::ShaderVariant` — so nothing here re-walks a module per draw.
+    // A vertex module never relocates, so it is always the base variant.
+    let v_variant = v_shader.variant(false, false);
+    let v_words = v_variant.words.clone();
     #[allow(unused_mut)]
-    let mut f_words = f_shader.words.clone();
+    let mut f_variant = f_shader.variant(false, false);
 
     {
         use crate::runtime::spirv_bind::{
@@ -5349,38 +5352,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // RAM at execute time); the rest stay on the CPU staging read.
         // Constant-step attribute streams stay CPU: the engine prepends a
         // base-instance prefix to those bytes at prepare time.
-        let constant_step_bufs: std::collections::BTreeSet<u32> = pd
-            .vertex_attributes
-            .iter()
-            .filter(|a| {
-                a.format != 0
-                    && a.stride != 0
-                    && translate::vertex::step_function(a.declared_step_function)
-                        == Ok(crate::backend::vulkan::engine::VertexStepFunction::Constant)
-            })
-            .map(|a| a.buffer_index)
-            .collect();
-        // Every buffer index the pipeline's attribute list names, gathered once
-        // rather than rescanned per bind.
         //
-        // Not to be confused with `stage_in_bufs` further down, which is a
-        // different set built for a different job: that one is filled during the
-        // attribute walk and holds only the indices that actually carried bytes,
-        // and it decides storage binding. This one is every index the list
-        // mentions, and it only ever *refuses* a neutral substitution.
-        //
-        // Unfiltered on purpose. An attribute with `format == 0` or a zero
-        // stride is skipped by the walk below and reads no bytes, but excluding
-        // those here would make this set depend on the same two fields the walk
-        // re-derives through `bind_attribute_stride`, and the two would drift
-        // apart the first time that derivation changed. Listing an index the
-        // walk turns out to skip costs one gather and never correctness, which
-        // is the direction this set is allowed to be wrong in.
-        let attribute_bufs: std::collections::BTreeSet<u32> = pd
-            .vertex_attributes
-            .iter()
-            .map(|a| a.buffer_index)
-            .collect();
+        // Which indices those are, and which the attribute list names at all,
+        // are both functions of the pipeline's attribute list and nothing else,
+        // so they are resolved with the pipeline rather than rebuilt per draw —
+        // see [`crate::runtime::pipeline_resolve::VertexBindPlan`], which also
+        // carries why the second set is deliberately unfiltered. Not to be
+        // confused with `stage_in_bufs` further down: that one is filled during
+        // the attribute walk, holds only the indices that actually carried
+        // bytes, and decides storage binding.
+        let bind_plan = &resolved.bind_plan;
         let mut vtx_storage: Vec<(u32, crate::backend::vulkan::engine::BufferContent)> = Vec::new();
         // The three `bind_phase` spans below divide `chain_phase`'s `binds_us`,
         // which is this draw path's largest column and covered three costs with
@@ -5392,7 +5373,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             if b.buffer_ref == 0 {
                 continue;
             }
-            let allow_zc = !constant_step_bufs.contains(&b.index);
+            let allow_zc = !bind_plan.is_constant_step(b.index);
             // The vertex shader's own reflection bounds its own `[[buffer(n)]]`
             // binds. A buffer feeding `[[stage_in]]` is a vertex *attribute*
             // rather than a declared argument, so reflection lists no Buffer at
@@ -5414,7 +5395,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             // first is what `Unused` is about, so an index the pipeline's
             // attribute list names keeps its guest bytes whatever reflection
             // says about the argument.
-            let feeds_stage_in = attribute_bufs.contains(&b.index);
+            let feeds_stage_in = bind_plan.feeds_stage_in(b.index);
             let content = if crate::runtime::spirv_bind::may_serve_neutral(access, feeds_stage_in) {
                 crate::runtime::bind_phase::note_neutral_served();
                 crate::backend::vulkan::engine::BufferContent::Bytes(
@@ -5573,8 +5554,9 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // sampled-with-buffer coupling is kept so the engine's image/sampler
         // binding base mirrors one flag pair, not a third variant.
         if separate_sampled || buf_collide {
-            f_words = f_shader.fragment_words(separate_sampled, buf_collide);
+            f_variant = f_shader.variant(separate_sampled, buf_collide);
         }
+        let f_words = f_variant.words.clone();
 
         // Non-stage-in vertex buffers + fragment buffers as storage buffers.
         //
@@ -6221,9 +6203,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             }
             // Reflect the residual shader interface and provision defaults only
             // where explicit guest or constexpr state did not already win.
-            for binding in crate::runtime::spirv_bind::sampler_bindings(&v_words)
-                .into_iter()
-                .chain(crate::runtime::spirv_bind::sampler_bindings(&f_words))
+            for &binding in v_variant
+                .sampler_bindings
+                .iter()
+                .chain(f_variant.sampler_bindings.iter())
             {
                 if sampler_binds.insert(binding) {
                     samplers.push(

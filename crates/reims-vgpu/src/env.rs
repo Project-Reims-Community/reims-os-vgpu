@@ -680,6 +680,87 @@ pub const GPU_SPANS: &str = "REIMS_VGPU_GPU_SPANS";
 /// one.
 pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 
+/// **Default off.** `on` records one extra empty render pass instance per
+/// loading draw, on the target the draw just finished with. A probe, never a
+/// change: it adds work and removes none, and the pixels are identical because
+/// the extra instance loads and stores the attachment and draws nothing into it.
+///
+/// # What it prices, and why nothing else can
+///
+/// Every batched draw opens and closes its own render pass. `passmerge_*` /
+/// `passheld_*` (see [`crate::backend::vulkan::engine`]'s `PassObstacles`) say
+/// how many of them *could* share one: 82 % of draws, once the guest gathers
+/// they record between the draws are hoisted out of the way. Hoisting them
+/// needs a second command buffer per batch, which is a large change to the ring,
+/// and nothing in this device says what the pass pair it would remove actually
+/// costs.
+///
+/// This is the positive control for that number, on the pattern
+/// [`LAYOUT_CHURN`] set: an arm that pays the cost *twice* prices it once. The
+/// probe records the transition back into `COLOR_ATTACHMENT_OPTIMAL` that a
+/// second instance needs, then a `vkCmdBeginRenderPass` / `vkCmdEndRenderPass`
+/// pair on the same render pass, framebuffer and area. The extra transition is
+/// not a confound: [`LAYOUT_CHURN`]'s six boots measured that this host's
+/// full-attachment transitions cost less than the boot-to-boot spread, so what
+/// separates the arms here is the pass pair.
+///
+/// Read it on `present_hz` over the fast population, which is what ranks a
+/// per-draw change on this device — the arithmetic and the elasticity are beside
+/// `crate::runtime::drain::census::VBL_REPORT_EARLY`. A pair that costs ~1.5 us
+/// of the ~14 us this device spends per draw is a ~10 % arm and separates
+/// cleanly; a pair that costs 0.2 us does not, and the merge is then an
+/// iGPU-and-tiler lever only, which is exactly what [`LAYOUT_CHURN`] concluded
+/// about the transitions.
+///
+/// Only loading draws take it. A `CLEAR` pass instance replayed after the draw
+/// would clear away what the draw just rendered, so the probe would not be
+/// pixel-neutral — and loading draws are the population a merge applies to
+/// anyway, since a clearing joiner gets a different `VkRenderPass` and could
+/// never have shared the instance.
+///
+/// # What it read: the pair costs 3 % of a draw and no frames
+///
+/// Twenty interleaved driven macos-13 sustained-animation boots, one pin,
+/// quiesced host, ten an arm. Scored on the driven window only and within the
+/// fast population only, per the rules beside
+/// `crate::runtime::drain::census::VBL_REPORT_EARLY`:
+///
+/// ```text
+///                        n   mean     range
+/// draw_us/draw   off     7   13.33    13.01 .. 14.12
+///                on      4   13.75    13.63 .. 13.83
+/// present_hz     off     7  113.54   111.40 ..115.80
+///                on      4  112.83   112.00 ..113.50
+/// ```
+///
+/// Six of the seven `off` boots read below every `on` boot, so the per-draw
+/// column separates: **+3.2 %, about 0.42 us of the ~13.3 us this device spends
+/// per draw.** The frame rate does not: −0.6 % with the ranges nested, which is
+/// what a 3.2 % per-draw arm is expected to look like at this elasticity and is
+/// the reason the sizing note says 2 % is not measurable here.
+///
+/// So the arithmetic for the merge, which is the only reason this probe exists:
+/// `passheld_*` puts the reachable share at 82 % of draws, 0.82 x 0.42 us is
+/// ~0.34 us, ~2.6 % of per-draw CPU, **~1.5 % of frames.** Against that, the
+/// change is a second command buffer per batch, a rewrite of the ring's
+/// submission, and a deferred pass end whose failure mode is a Vulkan
+/// render-pass-scope violation on a host with no validation layer installed.
+///
+/// **Do not build it for this host.** The verdict is the same shape as
+/// [`LAYOUT_CHURN`]'s and for the same reason: an immediate-mode discrete GPU
+/// with a fast CPU beside it does not care, and this project has no other host
+/// to boot. It is a real lever on a tile-based renderer, where a pass boundary
+/// is a load and store of the whole attachment through tile memory rather than
+/// a driver call — which is every iGPU, and both Apple Silicon pathways in the
+/// support matrix. Anyone with one of those answers it in the boots this took.
+///
+/// Two things about the run that are *not* findings, recorded so nobody reads
+/// them as such. The `on` arm drew 4 fast boots of 10 against the `off` arm's 7;
+/// a slow rate is a Bernoulli draw whose base rate drifts, and ten boots an arm
+/// cannot separate 0.4 from 0.7. And one `on` boot wedged at 5.7 Hz and 622
+/// us/draw — excluded as slow, and a single such boot says nothing either.
+pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
+
 /// **Default off.** `on` lets a declared object size narrow the guest bytes the
 /// gather rail *moves*, instead of only narrowing binds that stay above the
 /// zero-copy floor after narrowing — which is none of them.
@@ -863,7 +944,7 @@ pub fn switch(name: &str) -> Switch {
 /// Nothing enforces that a new `pub const` above is added to this list; the rule
 /// is stated and honestly unenforced. What keeps it small is that the list is
 /// next to the constants, and [`report_line`] is the only consumer.
-pub const ALL: [&str; 19] = [
+pub const ALL: [&str; 20] = [
     LAZY_WRITEBACK,
     SLAB_RETAIN,
     CLEAR_SEED,
@@ -887,6 +968,7 @@ pub const ALL: [&str; 19] = [
     COMPUTE_GATHER,
     GPU_SPANS,
     LAYOUT_CHURN,
+    PASS_CHURN,
     EXTENT_NARROW,
 ];
 

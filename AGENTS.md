@@ -607,8 +607,29 @@ frames raises *both*. Always quote them together:
   again. Check `busy_fence` and `busy_acquire`; on the shipping depth they are 0.
 - neither moved — the change bought no frames, whatever else it bought.
 
-`drain_duty draws` and anything normalized per draw stay the right way to rank a
-change that is about per-draw cost rather than about frames.
+**In the fast population `present_hz` is the score, and it is sharper than
+`us/draw`.** A fast-latching macos-13 guest free-runs on a zero frame period, so
+its rate is *work-limited*: whatever this device stops doing per draw, the guest
+spends on more frames. Twenty-four interleaved boots pushed the device 20.6 %
+the wrong way (`REIMS_VGPU_COMPUTE_GATHER=off`), scored over their fast boots
+only:
+
+| arm | n fast | `present_hz` mean (range) | `us/draw` mean (range) |
+|---|---|---|---|
+| shipping | 5 | **113.2** (109.8-116.3) | 13.21 (12.66-14.02) |
+| 20.6 % more GPU work/draw | 9 | **105.5** (101.4-107.7) | 15.07 (13.92-16.16) |
+
+The `present_hz` arms are **disjoint** — the slowest shipping boot beats the
+fastest slowed one — while `us/draw` *overlaps* on the same fourteen boots. So
+the frame rate is the more sensitive instrument of the two, not the noisier one,
+and a per-draw saving that cannot be seen in `present_hz` over five fast boots an
+arm is smaller than it looks. Elasticity for sizing a candidate: about **0.35
+frames per unit of per-draw GPU work**, so a 10 % per-draw saving is worth
+looking for and a 2 % one is not measurable here.
+
+`drain_duty draws` and anything normalized per draw stay the right way to
+*attribute* a change — which phase paid — but they are no longer the way to rank
+one.
 
 **Quote the presents, never the drop percentage.** This survives the fix and is
 the trap that cost a session a wrong call. With a *clamped* presenter the drop
@@ -664,12 +685,47 @@ So a throughput, caching or cadence change needs
 Name which probe a number came from, the same way a rail is named: they are two populations of draws
 and a change can help one and hurt the other.
 
-**Classify the boot before comparing two of them.** The guest itself has more than one compositing
-regime and picks between them per boot — the sustained probe reads either ~420 or ~268 draws per
-presented frame, tightly, with nothing in between. `present_hz` is not comparable across the two, and
-mixing boots from both is how a real 17 % effect ends up buried under a 24 % artifact. Everything
-else reproduces to a fraction of a percent *within* a regime, which is what makes three boots per arm
-enough to separate one. `drain_duty draws` over `window_publish fresh` is the discriminator.
+**Classify the boot before comparing two of them.** A macos-13 boot presents either ~60 frames a
+second or ~95-117 for its whole life, tightly, with nothing in between, and the guest picks per boot.
+`present_hz`, `draws/s` and `fresh` are all halved on a slow boot, so none of them is comparable
+across the two. Mixing boots from both populations is how a real 17 % effect ends up buried under a
+2x artifact. `present_hz` alone is the discriminator — the gap between 61 and 94 is empty on every
+boot on record.
+
+**`us/draw` is not comparable across the populations either, and it reads like it should be.** A slow
+boot asks the GPU for half the work, the governor clocks down, and every GPU microsecond gets more
+expensive: over 16 boots with `nvidia-smi` sampled alongside, slow boots read **10.3 % higher
+`us/draw`** than fast ones on one binary (15.68 against 14.22), and `us/draw` against the driven-window
+clock correlates at r=-0.89. So an arm that happens to draw more slow boots reads slower per draw for
+a reason that has nothing to do with the change. Score per-draw numbers within the fast population
+only.
+
+Within that population `us/draw` has a **coefficient of variation of 3.4 %** and a 12 % max-to-min
+spread over twelve boots, so a per-draw change under ~5 % needs several boots an arm and a single
+pair proves nothing. Do not try to correct for the clock arithmetically: dividing by the SM clock
+makes the spread *worse* (12 % to 22 %), because the gather is bandwidth-bound and the memory clock
+swings 405-14001 MHz independently.
+
+**A run's slow rate is a Bernoulli draw, and its base rate drifts.** Over 40 interleaved boots it was
+12 slow in 40; two runs later the same binary read 7 in 12, twice. So a slow rate is comparable only
+**within one interleaved run**, never against a number from an earlier one, and a change claiming to
+move it needs about twenty boots an arm — twelve cannot separate 0.4 from 0.7. This is a different
+rule from classifying a boot: that one is about which population a reading came from, this one is
+about the population *rate* being unstable across time on one host.
+
+**The split is not about VBL delivery, and six hypotheses that assumed it was all came back null.**
+The guest's compositor paces on a period the kernel hands it, which is initialised to a synthesised
+1/60 s and only corrected from the `IOFBCurrentPixelClock`/`IOFBCurrentPixelCount` framebuffer
+properties — and the paravirtual framebuffer driver suppresses those, on every boot, confirmed by
+`ioreg` on eleven. A boot therefore latches either 16 666 666 ns (paced, **exactly** 60 Hz) or 0
+(free-running, work-limited 95-117 Hz), once, for its life. That is why the slow population is a
+constant and the fast one is a 22 Hz spread, and it means the *fast* boots are the ones where the
+guest never learned a period. Do not "fix" it by forcing a second display-mode change: that would
+set the period on every boot and take the good 70 % down to 60 Hz. Full chain and the live
+confirmation are in `VBL_REPORT_EARLY` beside `runtime::drain::census::VblCensus`. Read `VBL_REPORT_EARLY` beside
+`runtime::drain::census::VblCensus` before spending boots on a new theory: a run of eight holds one
+or two slow boots and so cannot tell a cause from a coincidence, which has already produced one
+confident wrong answer here.
 
 **Bracket one character of every `pkill -f` pattern**, as `x86_6[4]` does above and as
 `reims_vgp[u]-` does further down. `pkill -f` matches against whole command lines, and the shell
@@ -678,6 +734,14 @@ process issuing it and the shell kills itself before `pkill` ever reaches QEMU. 
 the pattern text without changing what it matches. The failure is easy to misread as "the command
 worked": the shell dies with status 144 and the surviving QEMU then holds `localhost:2222`, so the
 *next* boot dies on the `hostfwd` rule for the reason described below. Two symptoms, one cause.
+
+**The bracket protects only the shell that issues the `pkill`. Every ancestor is still a match**, so
+a pinned QEMU path must cross as an **exported variable and never as argv**. Any command line that
+names `.../reims-vgpu/…/qemu-system-x86_64-pin-whatever` matches `qemu-system-x86_6[4].*reims-vgpu`,
+and a chain runner that takes two pins as arguments is killed by the first boot it starts. That
+failure reads as success twice over: the runner prints its first "round 1 arm A" line and then
+simply stops, and the harness it launched under reports the unit as finished. An environment
+variable never appears in `/proc/pid/cmdline`, which is the whole fix.
 
 **Wait on the fail log, not on SSH alone.** The previous boot's QEMU outlives its script by long
 enough to still hold `localhost:2222`, and a new boot that loses that race dies on the `hostfwd` rule

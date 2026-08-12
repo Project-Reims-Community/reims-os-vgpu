@@ -95,6 +95,7 @@ impl ResourcePools {
             gather_free: HashMap::new(),
             gather_live: Vec::new(),
             cb_bound_buffers: std::collections::HashMap::new(),
+            cb_graphics: super::CbGraphicsState::default(),
             staging_hits: 0,
             staging_misses: 0,
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
@@ -144,6 +145,7 @@ impl ResourcePools {
             graveyard: Vec::new(),
             target_free: FreePool::new(TARGET_FREE_CAP_PER_KEY, TARGET_FREE_CAP_TOTAL),
             open_batch: None,
+            last_pass: None,
             slab: slab::SlabPool::new(),
             slabs: buffer_slab::BufferSlabs::new(),
             host_ram_imports: host_ram::HostRamImports::default(),
@@ -1307,6 +1309,11 @@ impl ResourcePools {
         // reader/compute/prefetch path (and prevents ring wrap from resetting
         // the still-recording batch CB).
         self.batch_flush(ctx, counters)?;
+        // Whatever pass was standing, the caller is about to record into a
+        // different command buffer than the one that opened it. Unconditional
+        // and above the early exits below, because every claim of a slot ends
+        // the echoed pass's recording session whether a batch was open or not.
+        self.forget_pass_echo();
         // Reap the oldest contiguous run of already-signaled slots before
         // claiming one, rather than only the slot about to be reused. The
         // readback path deliberately waits a fence without retiring (see
@@ -1569,6 +1576,48 @@ impl ResourcePools {
         self.open_batch.as_ref().map(|b| b.target == *target)
     }
 
+    /// Whether the pass a draw is about to open is the one already standing in
+    /// the same command buffer — see [`PassEcho`].
+    ///
+    /// False whenever nothing is echoed, so the first draw of a command buffer
+    /// answers "no" without a special case, which is correct: it has no
+    /// predecessor to continue.
+    pub(crate) fn pass_echoes(&self, echo: &PassEcho) -> bool {
+        self.last_pass.as_ref() == Some(echo)
+    }
+
+    /// Record the pass a draw just opened. Called at the `vkCmdBeginRenderPass`
+    /// and nowhere else, so the echo always names a pass that is standing.
+    pub(crate) fn note_pass_opened(&mut self, echo: PassEcho) {
+        self.last_pass = Some(echo);
+    }
+
+    /// Forget everything remembered about the command buffer that was
+    /// recording: the echoed pass and the graphics state it carried.
+    ///
+    /// Called wherever the command buffer holding them stops being the one a
+    /// draw would record into — a reset at `begin_entry`, a submit at the batch
+    /// flush, and teardown. Missing one would let a joiner believe a pass ended
+    /// in a previous submission is still open, which is why this is a method
+    /// rather than an assignment at each site.
+    ///
+    /// Both halves are dropped by one call because they are one fact, and
+    /// because the second is the more dangerous to get wrong. A stale echo makes
+    /// a draw *skip a `vkCmdBeginRenderPass`* only in an instrument that decides
+    /// nothing; a stale [`CbGraphicsState`] makes it skip a real
+    /// `vkCmdSetViewport`, and a recycled handle is exactly the case where that
+    /// state was made undefined by a `vkBeginCommandBuffer` the cache never saw.
+    /// The handle comparison inside that struct is the second lock on the same
+    /// door, not the first.
+    pub(crate) fn forget_pass_echo(&mut self) {
+        self.last_pass = None;
+        self.cb_graphics.cb = None;
+        self.cb_graphics.pipeline = None;
+        self.cb_graphics.viewports.clear();
+        self.cb_graphics.scissors.clear();
+        self.cb_graphics.stencil = None;
+    }
+
     /// Record a batch-deferred draw's completion: open the batch on its ring
     /// slot (opener) or extend it (joiner), accumulating the per-draw descriptor
     /// set for the single flush-time seal. The CB stays in recording state;
@@ -1682,6 +1731,9 @@ impl ResourcePools {
         let Some(mut batch) = self.open_batch.take() else {
             return Ok(());
         };
+        // The CB is about to be ended and submitted, so no pass inside it is
+        // still open to continue.
+        self.forget_pass_echo();
         counters.batch_flushes.fetch_add(1, Ordering::Relaxed);
         counters
             .batch_flush_draws
@@ -1834,6 +1886,126 @@ impl ResourcePools {
         crate::runtime::drain::note_store_route(why);
         crate::runtime::drain::note_store_route_n(entries_slug, n);
         self.cb_bound_buffers.clear();
+    }
+
+    /// Bind the graphics pipeline unless this command buffer already carries it.
+    ///
+    /// A pipeline change clears the dynamic half of [`CbGraphicsState`], which is
+    /// the rule that makes the three skips below sound whatever dynamic-state
+    /// list each pipeline was built with — see that type's doc.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be a command buffer in the recording state, and `pipeline` a
+    /// live graphics pipeline compatible with what the draw is about to record.
+    pub(crate) unsafe fn bind_graphics_pipeline(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        pipeline: vk::Pipeline,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.cb != Some(cb) {
+            // A recycled handle: everything the previous user of it bound was
+            // made undefined by the `vkBeginCommandBuffer` in between.
+            g.cb = Some(cb);
+            g.pipeline = None;
+            g.viewports.clear();
+            g.scissors.clear();
+            g.stencil = None;
+        }
+        if g.pipeline == Some(pipeline) {
+            counters.dynstate_pipeline_held.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.pipeline = Some(pipeline);
+        // Static state on the incoming pipeline may have replaced any of these,
+        // so none of them is known any more.
+        g.viewports.clear();
+        g.scissors.clear();
+        g.stencil = None;
+        unsafe { device.cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline) };
+    }
+
+    /// The scratch arrays a draw builds its viewport and scissor lists into,
+    /// cleared and ready.
+    ///
+    /// Handed out rather than allocated per draw: the lists are rebuilt every
+    /// draw and were two `Vec` allocations on the recording path, and the
+    /// comparison in [`Self::set_dynamic_viewport_scissor`] needs them in a
+    /// buffer it can swap rather than copy.
+    pub(crate) fn dynamic_scratch(&mut self) -> (&mut Vec<vk::Viewport>, &mut Vec<vk::Rect2D>) {
+        let g = &mut self.cb_graphics;
+        g.vp_scratch.clear();
+        g.sc_scratch.clear();
+        (&mut g.vp_scratch, &mut g.sc_scratch)
+    }
+
+    /// Record `vkCmdSetViewport` / `vkCmdSetScissor` from the scratch arrays,
+    /// each only if this command buffer is not already carrying exactly it.
+    ///
+    /// # Safety
+    ///
+    /// `cb` must be the recording command buffer most recently passed to
+    /// [`Self::bind_graphics_pipeline`], so the pipeline-change rule that
+    /// authorises the skip has been applied.
+    pub(crate) unsafe fn set_dynamic_viewport_scissor(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+    ) {
+        let g = &mut self.cb_graphics;
+        if super::viewports_match(&g.vp_scratch, &g.viewports) {
+            counters.dynstate_viewport_held.fetch_add(1, Ordering::Relaxed);
+        } else {
+            std::mem::swap(&mut g.viewports, &mut g.vp_scratch);
+            unsafe { device.cmd_set_viewport(cb, 0, &g.viewports) };
+        }
+        if super::scissors_match(&g.sc_scratch, &g.scissors) {
+            counters.dynstate_scissor_held.fetch_add(1, Ordering::Relaxed);
+        } else {
+            std::mem::swap(&mut g.scissors, &mut g.sc_scratch);
+            unsafe { device.cmd_set_scissor(cb, 0, &g.scissors) };
+        }
+    }
+
+    /// The scissor rectangles this command buffer is carrying, which are the
+    /// recording draw's.
+    ///
+    /// True on both arms of the skip and that is the point: a draw that set them
+    /// swapped its own array in, and a draw that skipped did so *because* the
+    /// array already there is bit-for-bit what it would have sent. A consumer
+    /// that kept its own copy would be a second spelling of the same rects.
+    pub(crate) fn bound_scissors(&self) -> &[vk::Rect2D] {
+        &self.cb_graphics.scissors
+    }
+
+    /// Record both `vkCmdSetStencilReference` faces unless this command buffer
+    /// already carries exactly this pair.
+    ///
+    /// # Safety
+    ///
+    /// As [`Self::set_dynamic_viewport_scissor`].
+    pub(crate) unsafe fn set_dynamic_stencil_reference(
+        &mut self,
+        device: &ash::Device,
+        cb: vk::CommandBuffer,
+        counters: &EngineCounters,
+        front: u32,
+        back: u32,
+    ) {
+        let g = &mut self.cb_graphics;
+        if g.stencil == Some((front, back)) {
+            counters.dynstate_stencil_held.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        g.stencil = Some((front, back));
+        unsafe {
+            device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, front);
+            device.cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, back);
+        }
     }
 
     /// Clear the guest-read debt and answer whether there was one.

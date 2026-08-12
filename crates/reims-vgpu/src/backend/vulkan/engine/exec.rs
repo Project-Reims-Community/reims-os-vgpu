@@ -113,6 +113,23 @@ fn layout_churn_probe_enabled() -> bool {
     })
 }
 
+/// Whether the pass-churn probe is on. **Default off**, and never anything but a
+/// probe: it adds one empty render pass instance per loading draw and removes
+/// nothing.
+///
+/// See its one call site for what it prices, and [`crate::env::PASS_CHURN`] for
+/// why the question is not otherwise answerable without building the merge it is
+/// pricing.
+fn pass_churn_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::env::read(crate::env::PASS_CHURN).0,
+            crate::env::Switch::On
+        )
+    })
+}
+
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -121,6 +138,118 @@ fn compute_gather_enabled() -> bool {
             crate::env::Switch::Off
         )
     })
+}
+
+/// One thing a draw records that a render pass instance cannot contain.
+///
+/// The variants are the recording sites in [`execute_draw_inner`], one each, and
+/// they exist as a type rather than as the route string each used to carry so
+/// that the two ladders below cannot come apart: a new obstacle fails to compile
+/// until both spellings exist, where a second `get_or_insert` of a hand-written
+/// name would simply be missing from one of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PassObstacle {
+    /// A target sampled by its own draw, captured before the attachment changes.
+    Snapshot,
+    /// The seed copy that gives a `LOAD` pass its prior content.
+    Seed,
+    /// The colour target transitioned back into attachment use.
+    TargetLayout,
+    /// A `CLEAR` pass's colour writes waiting for whoever last read the target.
+    ClearWait,
+    /// A sampled resident transitioned to shader-read.
+    ResidentLayout,
+    /// A CPU-origin or guest-origin upload into a sampled image.
+    SampledUpload,
+    /// The compute dispatches (or transfer copies) that assemble scattered guest
+    /// buffer windows.
+    Gather,
+    /// An MRT secondary attachment transitioned back into attachment use.
+    MrtLayout,
+    /// `vkCmdResetQueryPool` for an occlusion query.
+    QueryReset,
+}
+
+impl PassObstacle {
+    /// Whether this obstacle exists **only because the previous draw's pass was
+    /// closed**.
+    ///
+    /// [`super::caches::ObjectCaches::get_or_create_pass`] ends every pass with
+    /// `final_layout = TRANSFER_SRC_OPTIMAL`, so the next draw into that target
+    /// has to barrier its colour attachments back to
+    /// `COLOR_ATTACHMENT_OPTIMAL`. A pass that was never ended never moved them,
+    /// so those two transitions have nothing to undo and are not recorded at
+    /// all. Every other variant is work the draw owes whatever the pass did — a
+    /// sampled resident still has to become shader-readable, a gather still has
+    /// to run — so holding the pass open does not remove it, it only means the
+    /// pass has to be closed to record it.
+    fn is_pass_end_artifact(self) -> bool {
+        matches!(self, Self::TargetLayout | Self::MrtLayout)
+    }
+
+    /// The `passmerge_*` route for the ladder that charges the nearest obstacle
+    /// as this device records today.
+    fn route(self) -> &'static str {
+        match self {
+            Self::Snapshot => "passmerge_outside_snapshot",
+            Self::Seed => "passmerge_outside_seed",
+            Self::TargetLayout => "passmerge_outside_target_layout",
+            Self::ClearWait => "passmerge_outside_clear_wait",
+            Self::ResidentLayout => "passmerge_outside_resident_layout",
+            Self::SampledUpload => "passmerge_outside_sampled_upload",
+            Self::Gather => "passmerge_outside_gather",
+            Self::MrtLayout => "passmerge_outside_mrt_layout",
+            Self::QueryReset => "passmerge_outside_query_reset",
+        }
+    }
+
+    /// The `passheld_*` route for the ladder that charges the nearest obstacle a
+    /// held-open pass would still meet.
+    fn held_route(self) -> &'static str {
+        match self {
+            Self::Snapshot => "passheld_outside_snapshot",
+            Self::Seed => "passheld_outside_seed",
+            Self::TargetLayout | Self::MrtLayout => unreachable!(
+                "an attachment-layout obstacle is not recorded on the held ladder"
+            ),
+            Self::ClearWait => "passheld_outside_clear_wait",
+            Self::ResidentLayout => "passheld_outside_resident_layout",
+            Self::SampledUpload => "passheld_outside_sampled_upload",
+            Self::Gather => "passheld_outside_gather",
+            Self::QueryReset => "passheld_outside_query_reset",
+        }
+    }
+}
+
+/// The nearest obstacle a draw records, read twice: once as this device records
+/// today, and once as it would record if a pass were never closed between two
+/// draws of one command buffer.
+///
+/// Both are needed because the first answered its own question and hid the next
+/// one. `passmerge_outside_target_layout` took 82.4 % of draws, which says the
+/// attachment transition is the nearest obstacle and says **nothing** about what
+/// stands behind it — and that is the number that decides whether holding the
+/// pass open is worth building, because the transition is the one obstacle that
+/// holding the pass open removes by construction.
+///
+/// Observation only. Nothing here changes what is recorded.
+#[derive(Default)]
+struct PassObstacles {
+    first: Option<PassObstacle>,
+    first_held: Option<PassObstacle>,
+}
+
+impl PassObstacles {
+    /// Charge one obstacle, at the site that records it and after whatever
+    /// `continue` decides the site is a no-op for this draw. The first wins on
+    /// each ladder, because the question is what ended the pass that was
+    /// standing.
+    fn note(&mut self, obstacle: PassObstacle) {
+        self.first.get_or_insert(obstacle);
+        if !obstacle.is_pass_end_artifact() {
+            self.first_held.get_or_insert(obstacle);
+        }
+    }
 }
 
 /// Turn every pending gather into dispatches, or `None` to leave the whole
@@ -3018,6 +3147,21 @@ pub(crate) unsafe fn execute_draw_inner(
         };
     }
 
+    // What this draw records that a render pass instance cannot contain, on the
+    // two ladders [`PassObstacles`] keeps.
+    //
+    // Every site below that emits a barrier, a copy or a dispatch names itself
+    // here, *after* whatever `continue` decides the site is a no-op for this
+    // draw — a loop that skips every element records nothing and must not claim
+    // it did. The first obstacle wins on each ladder, because the question is
+    // whether the pass standing from the previous draw survived to here, and the
+    // first thing recorded is what ended it.
+    //
+    // This decides nothing. It is read once, at the `vkCmdBeginRenderPass`
+    // below, to charge this draw to one bucket of `passmerge_*` and one of
+    // `passheld_*`.
+    let mut outside_pass = PassObstacles::default();
+
     // Metal permits a pass to sample the same texture it renders into. Vulkan
     // does not permit that attachment feedback loop on this path, so capture
     // the prior resident content into a same-format GPU image before changing
@@ -3037,6 +3181,7 @@ pub(crate) unsafe fn execute_draw_inner(
             continue;
         };
         target_snapshotted = true;
+        outside_pass.note(PassObstacle::Snapshot);
         // Once per distinct source: duplicate bindings of one target share the
         // image, so a second barrier for it would order nothing new. The
         // *first* is unconditional — the source is a registry resident this
@@ -3097,6 +3242,7 @@ pub(crate) unsafe fn execute_draw_inner(
 
     // Seed upload (CPU import).
     if let Some(seed) = &seed_slot {
+        outside_pass.note(PassObstacle::Seed);
         let (src_stage, src_access) =
             target_prior_access(target_snapshotted, target_access).source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
@@ -3148,6 +3294,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if let Some((seed_image, seed_access)) = seed_from_resolved {
+        outside_pass.note(PassObstacle::Seed);
         // GPU present-boundary seed: resident front frame → draw target copy,
         // then the pass runs with LOAD.
         //
@@ -3215,6 +3362,7 @@ pub(crate) unsafe fn execute_draw_inner(
             std::sync::atomic::Ordering::Relaxed,
         );
     } else if load_uses_gpu_content {
+        outside_pass.note(PassObstacle::TargetLayout);
         // A prior direct sample may have left this target shader-readable;
         // transition from the registry's tracked layout back to attachment use.
         let prior = target_prior_access(target_snapshotted, target_access);
@@ -3238,6 +3386,7 @@ pub(crate) unsafe fn execute_draw_inner(
             &barrier,
         );
     } else if target_snapshotted || target_access != super::pools::ResidentAccess::Untouched {
+        outside_pass.note(PassObstacle::ClearWait);
         // The Clear render pass discards prior content via initialLayout
         // UNDEFINED, so nothing here preserves pixels — but its colour writes
         // still have to wait for whoever last read them, and on this path the
@@ -3295,6 +3444,7 @@ pub(crate) unsafe fn execute_draw_inner(
         {
             continue;
         }
+        outside_pass.note(PassObstacle::ResidentLayout);
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -3326,6 +3476,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
+        outside_pass.note(PassObstacle::SampledUpload);
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -3352,6 +3503,9 @@ pub(crate) unsafe fn execute_draw_inner(
     //
     // Either form lands byte-identical bytes; which one ran decides only this
     // barrier's source scope, and `buffer_gather_dispatches` says which it was.
+    if !guest_gathers.is_empty() {
+        outside_pass.note(PassObstacle::Gather);
+    }
     let gather_dispatched = if guest_gathers.is_empty() || !compute_gather_enabled() {
         false
     } else {
@@ -3450,6 +3604,7 @@ pub(crate) unsafe fn execute_draw_inner(
         else {
             continue;
         };
+        outside_pass.note(PassObstacle::SampledUpload);
         upload_buffer_to_sampled_image(
             ctx,
             cb,
@@ -3472,6 +3627,7 @@ pub(crate) unsafe fn execute_draw_inner(
         if *access == super::pools::ResidentAccess::Untouched {
             continue;
         }
+        outside_pass.note(PassObstacle::MrtLayout);
         let (src_stage, src_access) = access.source_scope();
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(src_access)
@@ -3528,14 +3684,148 @@ pub(crate) unsafe fn execute_draw_inner(
                 .device
                 .create_query_pool(&ci, None)
                 .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::ExecCreateQueryPool, e)))?;
+            outside_pass.note(PassObstacle::QueryReset);
             ctx.device.cmd_reset_query_pool(cb, pool, 0, 1);
             Some((pool, flags))
         }
     };
+    // What this draw would have needed to continue the pass its predecessor
+    // left standing, charged to exactly one bucket. `join_same_target` already
+    // says how many draws render into the batch's own target; this says how many
+    // of those could have shared the pass, which is the number the merge is
+    // worth. The ladder is ordered so each rung names the *nearest* obstacle: a
+    // draw that never joined has no pass to continue whatever else is true of
+    // it, and a draw whose pass instance differs would need a new one even if it
+    // recorded nothing.
+    //
+    // Observation only — the pass is begun below either way.
+    //
+    // Each family's buckets are exhaustive over draws that reach here, which is
+    // the cheapest way to catch a mis-placed `note`: summed over a census window
+    // each family equals `chain_phase chains`, and `passmerge_no_join` alone
+    // equals that count less `engine_delta batch_joins`. A total that falls
+    // short means a draw took a path that skips this line; a `no_join` that
+    // disagrees means `joins` and the batch counters have come apart.
+    //
+    // # Why there are two families, and why the first one answered nothing
+    //
+    // Two driven macos-13 sustained-animation boots, quiesced, both fast
+    // (`present_hz` 115.0 and 114.0), sum identity exact on both:
+    //
+    // ```text
+    // bucket                          b1              b2
+    // outside_target_layout    850 698  82.4%  871 180  82.3%
+    // outside_snapshot          75 010   7.3%   77 740   7.3%
+    // no_join                   64 295   6.2%    66 396   6.3%
+    // pass_differs              41 904   4.1%    43 262   4.1%
+    // reachable                      0      0         0      0
+    // ```
+    //
+    // Nothing lands in `outside_gather`. The obstacle is a layout transition
+    // this device creates for itself: [`super::caches::ObjectCaches::get_or_create_pass`]
+    // ends every pass with `final_layout = TRANSFER_SRC_OPTIMAL` so a present
+    // blit or a readback can read the target without transitioning it, and the
+    // `LOAD` pass then names `initial_layout = COLOR_ATTACHMENT_OPTIMAL`, so the
+    // next draw into that target barriers the image all the way back.
+    //
+    // The trade is badly priced: `target_reads` is 1 199 a second — the present
+    // capture and the deferred-window flush, the only consumers that ending
+    // exists for — against ~24 000 draws a second that immediately undo it. On
+    // this discrete host that is a barrier and probably little else; on anything
+    // with framebuffer compression (every iGPU, every tiler, AMD DCC, Intel CCS)
+    // it is a decompress and recompress of the attachment per draw.
+    //
+    // **A ladder charges the nearest obstacle, so `outside_gather=0` does not
+    // mean gathers are rare.** `buffer_guest_gathers` is 34 564/s and they sit
+    // behind the layout barrier, which precedes them in record order — so the
+    // reading above says which obstacle is nearest and nothing whatever about
+    // what the merge is worth, because the nearest one is the single obstacle
+    // that holding the pass open removes by construction.
+    //
+    // `passheld_*` is the same ladder with those two transitions taken out — see
+    // [`PassObstacle::is_pass_end_artifact`] for why exactly those two and no
+    // others. It is the reading that decides whether a deferred pass end is
+    // worth building: `passheld_reachable` is how many draws a *local* merge
+    // could take with no lookahead at all, and whatever bucket holds the rest
+    // names the obstacle that would have to be hoisted to take them too.
+    //
+    // # What `passheld_*` read: a local merge is worth exactly nothing
+    //
+    // Two driven macos-13 sustained-animation boots, quiesced, sum identity
+    // exact on both families of both boots. The second latched the 60 Hz
+    // population and the first the fast one, and the split is the same to a
+    // tenth of a point either way — this is a structural property of the
+    // workload, not of a boot's pace:
+    //
+    // ```text
+    // bucket                       b1 (113 Hz)        b2 (59 Hz)
+    // outside_gather          849 627  81.6%     482 542  81.4%
+    // outside_snapshot         74 540   7.2%      42 211   7.1%
+    // no_join                  64 735   6.2%      38 004   6.4%
+    // pass_differs             42 068   4.0%      22 878   3.9%
+    // outside_resident_layout  10 772   1.0%       6 805   1.1%
+    // outside_sampled_upload      102   0.0%          96   0.0%
+    // reachable                     0      0            0      0
+    // ```
+    //
+    // **`reachable` is zero.** Every draw the attachment transition was hiding
+    // is hiding a guest gather behind it, which is a `vkCmdDispatch` and cannot
+    // be recorded inside a pass instance. So holding the pass open changes
+    // nothing on its own, and the 82 % is not a merge that exists — it is the
+    // merge that exists *if the gathers move*.
+    //
+    // Where they would move to is a second command buffer per batch: the
+    // dispatches recorded into a `pre` CB, the draws into the `main` one, both
+    // submitted in one `vkQueueSubmit` with a single compute→vertex barrier at
+    // the end of `pre` standing in for the ~1.3 per-draw barriers this device
+    // records today. That needs no lookahead — the two are recorded in parallel,
+    // not in order — which is what makes it reachable at all.
+    //
+    // **It is not worth building on this host, and that is measured rather than
+    // guessed.** [`crate::env::PASS_CHURN`] priced the pass pair over twenty
+    // interleaved boots at 0.42 us of a ~13.3 us draw, disjoint on the per-draw
+    // column and invisible on the frame rate. 82 % of 0.42 us is ~2.6 % of
+    // per-draw CPU and ~1.5 % of frames, against a rewrite of the ring's
+    // submission and a deferred pass end whose failure mode is a render-pass
+    // scope violation on a host with no validation layer. Read that switch's doc
+    // before reopening this; the arithmetic is all there, and so is the reason
+    // the answer is different on a tiler.
+    //
+    // The three obstacles that would remain cannot follow the gathers into
+    // `pre`: a snapshot copies the target an earlier draw of this same batch
+    // wrote, and a resident-layout barrier orders against that same write, so
+    // both would be hoisted to *before* the write they depend on. They are 8.2 %
+    // together and they stay.
+    let echo = super::pools::PassEcho {
+        cb,
+        pass: render_pass,
+        fb: target_fb,
+        area: (req.width, req.height),
+    };
+    let continues = joins && pools.pass_echoes(&echo);
+    crate::runtime::drain::note_store_route(if !joins {
+        "passmerge_no_join"
+    } else if !continues {
+        "passmerge_pass_differs"
+    } else {
+        outside_pass.first.map_or("passmerge_reachable", PassObstacle::route)
+    });
+    crate::runtime::drain::note_store_route(if !joins {
+        "passheld_no_join"
+    } else if !continues {
+        "passheld_pass_differs"
+    } else {
+        outside_pass
+            .first_held
+            .map_or("passheld_reachable", PassObstacle::held_route)
+    });
     ctx.device
         .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
-    ctx.device
-        .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
+    pools.note_pass_opened(echo);
+    // Only if this command buffer is not already carrying it — the three
+    // `dynstate_*` skips below hang off this one call, because a pipeline change
+    // is what invalidates them. See `super::pools::CbGraphicsState`.
+    unsafe { pools.bind_graphics_pipeline(&ctx.device, cb, counters, pipeline) };
     if let Some((pool, flags)) = occlusion {
         ctx.device.cmd_begin_query(cb, pool, 0, flags);
     }
@@ -3563,46 +3853,51 @@ pub(crate) unsafe fn execute_draw_inner(
     // request or `vkCmdSetViewport` binds a different count than the pipeline
     // declared.
     let slots = crate::backend::vulkan::engine::viewport_slot_count(req);
-    let viewports: Vec<vk::Viewport> = (0..slots)
-        .map(|i| {
-            let vp = req.viewports.get(i).copied().unwrap_or(default_vp);
-            vk::Viewport {
-                x: vp.x,
-                y: vp.y + vp.height,
-                width: vp.width,
-                height: -vp.height,
-                min_depth: vp.min_depth,
-                max_depth: vp.max_depth,
-            }
-        })
-        .collect();
-    ctx.device.cmd_set_viewport(cb, 0, &viewports);
-    let scissors: Vec<vk::Rect2D> = (0..slots)
-        .map(|i| {
-            let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
-            let x = sc.x.min(req.width);
-            let y = sc.y.min(req.height);
-            vk::Rect2D {
-                offset: vk::Offset2D {
-                    x: x as i32,
-                    y: y as i32,
-                },
-                extent: vk::Extent2D {
-                    width: sc.width.min(req.width - x),
-                    height: sc.height.min(req.height - y),
-                },
-            }
-        })
-        .collect();
-    ctx.device.cmd_set_scissor(cb, 0, &scissors);
+    // Built into the pools' scratch rather than into two fresh `Vec`s: these are
+    // rebuilt every draw, and the comparison that decides whether the driver
+    // already has them needs a buffer it can swap rather than copy.
+    let (vp_scratch, sc_scratch) = pools.dynamic_scratch();
+    vp_scratch.extend((0..slots).map(|i| {
+        let vp = req.viewports.get(i).copied().unwrap_or(default_vp);
+        vk::Viewport {
+            x: vp.x,
+            y: vp.y + vp.height,
+            width: vp.width,
+            height: -vp.height,
+            min_depth: vp.min_depth,
+            max_depth: vp.max_depth,
+        }
+    }));
+    sc_scratch.extend((0..slots).map(|i| {
+        let sc = req.scissors.get(i).copied().unwrap_or(default_sc);
+        let x = sc.x.min(req.width);
+        let y = sc.y.min(req.height);
+        vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x as i32,
+                y: y as i32,
+            },
+            extent: vk::Extent2D {
+                width: sc.width.min(req.width - x),
+                height: sc.height.min(req.height - y),
+            },
+        }
+    }));
+    unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
     // Dynamic stencil reference (Metal `setStencilFrontReferenceValue:back…`)
     // — only bound for stencil pipelines, which list STENCIL_REFERENCE as a
-    // dynamic state; front/back set separately to honor Metal's split refs.
+    // dynamic state; front/back set together because Metal's split refs are one
+    // guest state and a cache that held half of it would be two.
     if let Some(s) = req.depth.as_ref().and_then(|d| d.stencil) {
-        ctx.device
-            .cmd_set_stencil_reference(cb, vk::StencilFaceFlags::FRONT, s.reference_front);
-        ctx.device
-            .cmd_set_stencil_reference(cb, vk::StencilFaceFlags::BACK, s.reference_back);
+        unsafe {
+            pools.set_dynamic_stencil_reference(
+                &ctx.device,
+                cb,
+                counters,
+                s.reference_front,
+                s.reference_back,
+            )
+        };
     }
 
     if let Some(dset) = dset {
@@ -3646,6 +3941,51 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_end_query(cb, pool, 0);
     }
     ctx.device.cmd_end_render_pass(cb);
+    if pass_churn_probe_enabled() && load_uses_gpu_content {
+        // PROBE — `REIMS_VGPU_PASS_CHURN=on`. One extra render pass instance on
+        // the target this draw just finished with, loading and storing it and
+        // drawing nothing into it.
+        //
+        // It prices the pair this device pays on every batched draw and would
+        // stop paying if the pass were held open across a batch. `passheld_*`
+        // says 82 % of draws could share one instance once the guest gathers
+        // recorded between them are hoisted; hoisting needs a second command
+        // buffer per batch, and this says what that work would be worth before
+        // any of it is built. See [`crate::env::PASS_CHURN`].
+        //
+        // Pixel-neutral, which is what makes it a control rather than a change:
+        // `LOAD`/`STORE` preserves the attachment and no draw is recorded inside
+        // the instance. `load_uses_gpu_content` gates it because a `CLEAR` pass
+        // replayed here would clear away the draw's own output.
+        //
+        // The transition is the instance's, not a second confound: the pass has
+        // just left the attachment in `TRANSFER_SRC_OPTIMAL` and a `LOAD` pass
+        // names `initial_layout = COLOR_ATTACHMENT_OPTIMAL`, so the barrier is
+        // what the extra instance costs to begin. `LAYOUT_CHURN`'s six boots
+        // measured a full-attachment transition on this host at less than the
+        // boot-to-boot spread, so what separates the arms here is the pair.
+        let back = [vk::ImageMemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+            .dst_access_mask(
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            )
+            .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+            .image(target_image)
+            .subresource_range(super::color_subresource_range())];
+        ctx.device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &back,
+        );
+        ctx.device
+            .cmd_begin_render_pass(cb, &rp_begin, vk::SubpassContents::INLINE);
+        ctx.device.cmd_end_render_pass(cb);
+    }
     if layout_churn_probe_enabled() {
         // PROBE — `REIMS_VGPU_LAYOUT_CHURN=on`. One extra round trip of the
         // colour attachment's layout, out of `TRANSFER_SRC_OPTIMAL` and back
@@ -3808,7 +4148,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // on, and cheaper than computing a union of arbitrary rects.
         counters.note_draw_coverage(if rewrites_whole_attachment {
             super::counters::DrawCoverage::Full
-        } else if scissors.iter().any(|s| {
+        } else if pools.bound_scissors().iter().any(|s| {
             s.offset.x <= 0
                 && s.offset.y <= 0
                 && s.extent.width >= req.width

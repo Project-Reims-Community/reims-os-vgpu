@@ -2628,6 +2628,27 @@ fn shared_w32<H: HostMemory + HostOps>(host: &mut H, gpa: u64, off: u64, v: u32,
 /// pixel width. Modes are 1920×1080, 1440×1080, 1280×1024 (apple-gfx A/B
 /// reference geometry) plus 3840×2160 (4K UHD), each advertised at
 /// `DISPLAY_REFRESH_HZ` (120 Hz), so the guest always latches the 120 Hz mode.
+///
+/// # "Always" is measured, and it holds on the boots that look like it does not
+///
+/// About three macos-13 boots in ten present ~60 frames a second for their whole
+/// life rather than ~100-117, which reads exactly like a guest that selected a
+/// 60 Hz mode from this table. It did not. Twelve driven boots, asked over ssh
+/// while still up what mode they were running:
+///
+/// ```text
+/// boots      presented      system_profiler SPDisplaysDataType
+/// 5 fast    107 - 119 Hz    UI Looks like: 1920 x 1080 @ 120.00Hz
+/// 7 slow     59.9 - 61 Hz   UI Looks like: 1920 x 1080 @ 120.00Hz
+/// ```
+///
+/// Every boot, both populations, the same mode and the same 120.00 Hz. So mode
+/// negotiation is not where the split comes from, this table is doing its job,
+/// and a fix aimed at the timing elements would be aimed at nothing.
+///
+/// That leaves the cause downstream of mode selection, in what the guest's
+/// compositor does with a 120 Hz link it has correctly acquired. `VBL_REPORT_
+/// EARLY` beside [`census::VblCensus`] records what else has been ruled out.
 /// Element 0 (1920×1080) stays the native/preferred format (+0x210/+0x212 double
 /// as NativeFormat*Pixels), so boot resolution is unchanged and 4K is an
 /// additional selectable mode; the dynamic scanout/present/host-window geometry
@@ -5057,84 +5078,6 @@ pub(crate) fn claim_display_vbl(last_us: &std::sync::atomic::AtomicU64, now_us: 
         .is_ok()
 }
 
-pub(crate) fn display_event_enabled<H: HostMemory>(
-    host: &H,
-    gpa: u64,
-    event_mask: u32,
-) -> bool {
-    let mut mask_le = [0u8; 4];
-    if host
-        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
-        .is_err()
-    {
-        return false;
-    }
-    let mask = ld32(&mask_le);
-    crate::runtime::drain::census::note_display_enable_mask(mask);
-    mask & event_mask != 0
-}
-
-pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
-    host: &mut H,
-    gpa: u64,
-    display_index: u32,
-    intr_disp: &std::sync::atomic::AtomicU32,
-    page_size: usize,
-    last_us: &std::sync::atomic::AtomicU64,
-    now_us: u64,
-) {
-    let now_ms = now_us / 1_000;
-    let mut mask_le = [0u8; 4];
-    if host
-        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
-        .is_err()
-    {
-        note_vbl(VBL_NOT_ENABLED, now_ms);
-        return;
-    }
-    let mask = ld32(&mask_le);
-    crate::runtime::drain::census::note_display_enable_mask(mask);
-    let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
-    let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
-    if !vbl && !transaction {
-        note_vbl(VBL_NOT_ENABLED, now_ms);
-        return;
-    }
-    if !claim_display_vbl(last_us, now_us) {
-        note_vbl(VBL_NOT_CLAIMED, now_ms);
-        return;
-    }
-    note_vbl(if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED }, now_ms);
-    if transaction {
-        note_display_present_signal(DISPLAY_PRESENT_REFRESH);
-    }
-    let mut pending_le = [0u8; 4];
-    let pending = if host
-        .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
-        .is_ok()
-    {
-        ld32(&pending_le)
-    } else {
-        0
-    };
-    let stale = pending & DISPLAY_ONLINE_EVENT_MASK != 0;
-    let mut next = pending & !DISPLAY_ONLINE_EVENT_MASK;
-    if vbl {
-        next |= DISPLAY_VBL_EVENT_MASK;
-    }
-    if transaction {
-        next |= DISPLAY_PRESENT_EVENT_MASK;
-    }
-    shared_w32(host, gpa, DISPLAY_SHARED_PENDING, next, page_size);
-    if stale {
-        crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
-    }
-    intr_disp.fetch_or(
-        1u32 << (display_index & 0x1f),
-        std::sync::atomic::Ordering::AcqRel,
-    );
-    host.enqueue(HostAction::irq_gfx());
-}
 
 /// Pulse VBL at the phase-locked ~120 Hz cadence (grid interval
 /// [`DISPLAY_VBL_MIN_INTERVAL_US`]; see [`claim_display_vbl`]).
@@ -5318,6 +5261,98 @@ fn carrier_word(carried: Option<bool>) -> &'static str {
         Some(false) => "nothing",
         None => "unknown",
     }
+}
+
+/// Whether the guest has armed this display-event class. The enable mask is
+/// dynamic and must be read for every signal: guests arm and disarm VBL while
+/// compositing, and a pending bit outside the mask would never be cleared.
+pub(crate) fn display_event_enabled<H: HostMemory>(host: &H, gpa: u64, event_mask: u32) -> bool {
+    let mut mask_le = [0u8; 4];
+    if host
+        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+        .is_err()
+    {
+        return false;
+    }
+    let mask = ld32(&mask_le);
+    crate::runtime::drain::census::note_display_enable_mask(mask);
+    mask & event_mask != 0
+}
+
+/// Signal every display-completion class the guest has armed for one refresh
+/// tick. Reading the mask before claiming the grid slot is load-bearing: an
+/// unarmed one-shot sample must not consume the interval the guest is about to
+/// request.
+pub(crate) fn signal_display_refresh_classes<H: HostMemory + HostOps>(
+    host: &mut H,
+    gpa: u64,
+    display_index: u32,
+    intr_disp: &std::sync::atomic::AtomicU32,
+    page_size: usize,
+    last_us: &std::sync::atomic::AtomicU64,
+    now_us: u64,
+) {
+    let now_ms = now_us / 1_000;
+    let mut mask_le = [0u8; 4];
+    if host
+        .read_gpa(gpa + DISPLAY_SHARED_ENABLE_MASK, &mut mask_le)
+        .is_err()
+    {
+        note_vbl(VBL_NOT_ENABLED, now_ms);
+        return;
+    }
+    let mask = ld32(&mask_le);
+    crate::runtime::drain::census::note_display_enable_mask(mask);
+    let vbl = mask & DISPLAY_VBL_EVENT_MASK != 0;
+    let transaction = mask & DISPLAY_PRESENT_EVENT_MASK != 0;
+    if !vbl && !transaction {
+        note_vbl(VBL_NOT_ENABLED, now_ms);
+        return;
+    }
+    if !claim_display_vbl(last_us, now_us) {
+        note_vbl(VBL_NOT_CLAIMED, now_ms);
+        return;
+    }
+    note_vbl(
+        if vbl { VBL_DELIVERED } else { VBL_NOT_ENABLED },
+        now_ms,
+    );
+    if transaction {
+        note_display_present_signal(DISPLAY_PRESENT_REFRESH);
+    }
+
+    let mut pending_le = [0u8; 4];
+    let pending = if host
+        .read_gpa(gpa + DISPLAY_SHARED_PENDING, &mut pending_le)
+        .is_ok()
+    {
+        ld32(&pending_le)
+    } else {
+        0
+    };
+    // This path only runs after ONLINE acknowledgement. Drop a stale ONLINE
+    // bit rather than re-delivering it and rebuilding the guest overlay.
+    let stale = pending & DISPLAY_ONLINE_EVENT_MASK != 0;
+    let mut next = if stale {
+        pending & !DISPLAY_ONLINE_EVENT_MASK
+    } else {
+        pending
+    };
+    if vbl {
+        next |= DISPLAY_VBL_EVENT_MASK;
+    }
+    if transaction {
+        next |= DISPLAY_PRESENT_EVENT_MASK;
+    }
+    shared_w32(host, gpa, DISPLAY_SHARED_PENDING, next, page_size);
+    if stale {
+        crate::runtime::census::present_proxy::note_stale_online_pending("vbl", pending);
+    }
+    intr_disp.fetch_or(
+        1u32 << (display_index & 0x1f),
+        std::sync::atomic::Ordering::AcqRel,
+    );
+    host.enqueue(HostAction::irq_gfx());
 }
 
 #[cfg(test)]
