@@ -401,7 +401,7 @@ build_reims_vgpu_efi
 # alternate build.
 if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
   REIMS_VGPU_BACKEND="${REIMS_VGPU_BACKEND:-vulkan}"
-  echo "boot-x86.sh: building in-tree QEMU (scripts/qemu-build --target x86_64 --backend $REIMS_VGPU_BACKEND) ..."
+  echo "boot-x86.sh: checking in-tree QEMU build (scripts/qemu-build --target x86_64 --backend $REIMS_VGPU_BACKEND) ..."
   "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target x86_64 --backend "$REIMS_VGPU_BACKEND" \
     || die "qemu-build failed"
 else

@@ -245,7 +245,15 @@ printf '%s\n' "$REIMS_VGPU_BACKEND" > build/reims-vgpu-backend.stamp
 
 # --- Build ----------------------------------------------------------------------
 QEMU_BIN="$QEMU_SRC/build/qemu-system-${QEMU_TARGET}"
-echo "[qemu-build] building qemu-system-${QEMU_TARGET} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
+build_plan="$(ninja -C build -n "qemu-system-${QEMU_TARGET}" 2>&1)"
+if [ ! -x "$QEMU_BIN" ]; then
+  echo "[qemu-build] QEMU build: required (binary missing: $QEMU_BIN)"
+elif grep -qE '^\[[0-9]+/[0-9]+\]' <<<"$build_plan"; then
+  echo "[qemu-build] QEMU build: required (ninja has out-of-date targets)"
+else
+  echo "[qemu-build] QEMU build: not required (qemu-system-${QEMU_TARGET} is up to date)"
+fi
+echo "[qemu-build] checking/building qemu-system-${QEMU_TARGET} (links reims-vgpu / $REIMS_VGPU_BACKEND) ..."
 ninja -C build "qemu-system-${QEMU_TARGET}"
 
 # --- Verify (target-specific) ---------------------------------------------------

@@ -344,7 +344,7 @@ if [ -z "${REIMS_VGPU_BACKEND:-}" ]; then
   esac
 fi
 if [ "$QEMU_BIN" = "$QEMU_BIN_DEFAULT" ]; then
-  echo "boot-arm64.sh: building in-tree QEMU (scripts/qemu-build --target aarch64 --backend $REIMS_VGPU_BACKEND) ..."
+  echo "boot-arm64.sh: checking in-tree QEMU build (scripts/qemu-build --target aarch64 --backend $REIMS_VGPU_BACKEND) ..."
   "$REPO_ROOT/scripts/qemu-build/qemu-build.sh" --target aarch64 --backend "$REIMS_VGPU_BACKEND" \
     || die "qemu-build failed"
 else
