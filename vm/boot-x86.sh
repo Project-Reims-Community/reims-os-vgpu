@@ -359,6 +359,7 @@ fi  # end of rail/snapshot resolution
 # than adding a flag to each step.
 GUEST_DISK_FORMAT="qcow2"
 OPENCORE_FORMAT="qcow2"
+GUEST_DRIVE_OPTS=""
 if [ "$BOOT_CLASS" = "persistent" ]; then
   DISK="${REIMS_GUEST_DISK:-$DISKS_DIR/macos.img}"
   OPENCORE="${REIMS_GUEST_OPENCORE:-$DISKS_DIR/OpenCore.img}"
@@ -376,6 +377,20 @@ if [ "$BOOT_CLASS" = "persistent" ]; then
   # an explicit act by whoever knows what the file is.
   GUEST_DISK_FORMAT="${REIMS_GUEST_DISK_FORMAT:-raw}"
   OPENCORE_FORMAT="${REIMS_GUEST_OPENCORE_FORMAT:-raw}"
+
+  # cache=none takes the host page cache out of the path: the guest's own cache
+  # is already the cache, and double-buffering 16 GiB of guest RAM in host RAM
+  # costs memory that was budgeted for the guest. Guest flushes are still
+  # honoured either way -- which is what makes a host that loses power behave
+  # like a PC that loses power, APFS journal replay and all -- so this is about
+  # memory, not about safety.
+  #
+  # discard=unmap is what makes the guest's TRIM mean anything. Without it the
+  # config.plist's TRIM patch is decoration: macOS issues the command, QEMU
+  # drops it, and a sparse image only ever grows. detect-zeroes=unmap turns a
+  # run of zeroes into a hole as well, which is how an erase inside the guest
+  # gives space back to the host.
+  GUEST_DRIVE_OPTS=",cache=none,discard=unmap,detect-zeroes=unmap,aio=threads"
   IS_CLONE=0
   HAVE_SNAPSHOT=0
   RAIL_NAME="(persistent)"
@@ -613,14 +628,23 @@ QEMU_ARGS=(
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=$OPENCORE_FORMAT,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
-  -drive "id=MacHDD,if=none,format=$GUEST_DISK_FORMAT,file=$DISK"
+  -drive "id=MacHDD,if=none,format=$GUEST_DISK_FORMAT,file=$DISK$GUEST_DRIVE_OPTS"
   -device ide-hd,bus=sata.4,drive=MacHDD
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
 
 # Guest KP often reboots (even with OpenCore DB_HALT). Default exit so the GTK
 # window disappears and serial stays under vm/disks/run/serial-*.log.
-QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-exit}"
+# `exit` is right for a rail: a panic loop should end the run rather than spin,
+# and the serial log is the result. It is wrong for the installed system, where
+# a reboot is something the operator asked for -- macOS updates reboot midway
+# through, and Restart that kills the machine instead of restarting it is not a
+# behaviour anyone would call working. So a persistent boot resets, like a PC.
+if [ "$BOOT_CLASS" = "persistent" ]; then
+  QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-reset}"
+else
+  QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-exit}"
+fi
 case "$QEMU_REBOOT_ACTION" in
   exit)
     QEMU_ARGS+=(-action reboot=shutdown)
