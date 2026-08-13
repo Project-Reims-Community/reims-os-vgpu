@@ -11,6 +11,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+# Read by default; the release job raises its own to contents: write. Stating it
+# here means a new job cannot quietly inherit more than it needs.
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -70,8 +75,23 @@ jobs:
           name: reims-os-vgpu-rpm
           path: ~/rpmbuild/RPMS/*/*.rpm
 
-      - name: Attach to the release
-        if: github.ref_type == 'tag'
-        run: gh release upload "$GITHUB_REF_NAME" ~/rpmbuild/RPMS/*/*.rpm --clobber
-        env:
-          GH_TOKEN: ${{ github.token }}
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    # Not in the Fedora container: this needs no build tools, and the container
+    # has no gh. Attaching from the host runner also means the action can create
+    # the release, which a tag push does not do on its own.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: reims-os-vgpu-rpm
+          path: dist
+
+      - name: Attach the RPM to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**/*.rpm
+          fail_on_unmatched_files: true
