@@ -41,7 +41,10 @@
 #                  does is kept, which is what an operator's own macOS install
 #                  needs and what none of the three classes below provide.
 #                  Paths come from REIMS_GUEST_DISK / REIMS_GUEST_OPENCORE /
-#                  REIMS_GUEST_OVMF_VARS. Both images are RAW here, not qcow2:
+#                  REIMS_GUEST_OVMF_VARS, with REIMS_GUEST_DISK_FORMAT and
+#                  REIMS_GUEST_OPENCORE_FORMAT to override the format when
+#                  bringing an existing guest across.
+#                  Both images are RAW by default, not qcow2:
 #                  the disk lives on a NOCOW btrfs subvolume where qcow2 would
 #                  stack a second copy-on-write layer, and the EFI image is
 #                  built by the installer with guestfish onto a truncated file.
@@ -366,8 +369,13 @@ if [ "$BOOT_CLASS" = "persistent" ]; then
   # it with guestfish onto a truncated file. Attaching a raw image as qcow2
   # fails the magic check, and OVMF then finds no bootloader rather than saying
   # why.
-  GUEST_DISK_FORMAT="raw"
-  OPENCORE_FORMAT="raw"
+  # Raw is what the installer produces, so it is the default rather than
+  # something probed. Probing is how a guest escapes: write a qcow2 header into
+  # a raw disk and the next boot honours it, with a backing file of the guest's
+  # choosing. Overridable for bringing an existing qcow2 guest across, which is
+  # an explicit act by whoever knows what the file is.
+  GUEST_DISK_FORMAT="${REIMS_GUEST_DISK_FORMAT:-raw}"
+  OPENCORE_FORMAT="${REIMS_GUEST_OPENCORE_FORMAT:-raw}"
   IS_CLONE=0
   HAVE_SNAPSHOT=0
   RAIL_NAME="(persistent)"
