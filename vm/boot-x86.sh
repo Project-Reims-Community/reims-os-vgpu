@@ -395,7 +395,7 @@ The installer generates it from the manifest; set REIMS_GUEST_OPENCORE if it liv
     chmod u+w "$OVMF_VARS"
     echo "boot-x86.sh: initialised guest NVRAM at $OVMF_VARS from $OVMF_VARS_MASTER"
   fi
-  echo "boot-x86.sh: persistent — $DISK (raw, writable); nothing is cloned and nothing reverts"
+  echo "boot-x86.sh: persistent — $DISK ($GUEST_DISK_FORMAT, writable); nothing is cloned and nothing reverts"
 fi
 
 HAVE_SNAPSHOT=0
