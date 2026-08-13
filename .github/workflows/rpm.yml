@@ -1,0 +1,64 @@
+# Builds the reims-os-vgpu RPM that reims-os installs.
+#
+# The image consumes a *release asset*, not this repository: reims-os pins a
+# version and fetches it, so a change here reaches an image only by cutting a
+# release. That is the same rule reims-os-installer follows and the reason
+# neither project is a submodule of the other.
+name: rpm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -euxo pipefail
+          dnf -y install \
+            rpm-build rpmdevtools git-core \
+            cargo rust gcc make ninja-build meson python3 \
+            glib2-devel pixman-devel vulkan-loader-devel vulkan-headers
+
+      - uses: actions/checkout@v5
+        with:
+          # QEMU is a submodule and the build needs its source, not a pointer.
+          submodules: recursive
+
+      - name: Derive the version from the tag
+        id: version
+        run: |
+          set -euxo pipefail
+          # A workflow_dispatch has no tag; 0.0.0 marks a build that must not
+          # be mistaken for a release.
+          version="${GITHUB_REF_NAME#v}"
+          case "$GITHUB_REF_TYPE" in tag) ;; *) version="0.0.0" ;; esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the RPM
+        run: |
+          set -euxo pipefail
+          version="${{ steps.version.outputs.version }}"
+          rpmdev-setuptree
+          # The spec's %autosetup expects the tree under <name>-<version>/.
+          tar --exclude-vcs --exclude=vm/disks \
+              --transform "s,^\.,reims-os-vgpu-${version}," \
+              -czf ~/rpmbuild/SOURCES/reims-os-vgpu-${version}.tar.gz .
+          rpmbuild -bb packaging/reims-os-vgpu.spec \
+            --define "_topdir $HOME/rpmbuild" \
+            --define "version ${version}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: reims-os-vgpu-rpm
+          path: ~/rpmbuild/RPMS/*/*.rpm
+
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        run: gh release upload "$GITHUB_REF_NAME" ~/rpmbuild/RPMS/*/*.rpm --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
