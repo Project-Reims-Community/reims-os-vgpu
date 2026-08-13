@@ -36,6 +36,15 @@
 # and the pair is whatever it has always been.
 #
 # Boot classes:
+#   --persistent   THE INSTALLED SYSTEM. No rail, no snapshot, no clone and no
+#                  revert: boots fixed paths writable and everything the guest
+#                  does is kept, which is what an operator's own macOS install
+#                  needs and what none of the three classes below provide.
+#                  Paths come from REIMS_GUEST_DISK / REIMS_GUEST_OPENCORE /
+#                  REIMS_GUEST_OVMF_VARS. Both images are RAW here, not qcow2:
+#                  the disk lives on a NOCOW btrfs subvolume where qcow2 would
+#                  stack a second copy-on-write layer, and the EFI image is
+#                  built by the installer with guestfish onto a truncated file.
 #   --testing      agent-driven measurement (default): GUI + serial-to-file,
 #                  SSH-driven, 7-minute hard kill + capture-then-revert. Reverts.
 #   --interactive  human/GUI boot, no time limit. Reverts (nothing persists).
@@ -157,7 +166,7 @@ AUDIO_BUFFER_US="${AUDIO_BUFFER_US:-46440}"
 # notices.
 AUDIO_USB_BUFFER="${AUDIO_USB_BUFFER:-65536}"
 
-BOOT_CLASS="testing"          # testing | interactive | capture
+BOOT_CLASS="testing"          # persistent | testing | interactive | capture
 RAIL_LABEL="${RAIL:-}"        # empty = follow rails/current; else a rail name
 SNAPSHOT_LABEL=""             # empty = follow the rail's snapshots/current
 LIST_RAILS=0
@@ -181,6 +190,7 @@ usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interac
                                             host-owned Vulkan window (present + input)
                          vmware-svga         legacy OSX-KVM console (QEMU gtk window;
                                             no GPU output once the guest uses Reims vGPU)
+  --persistent           the installed system: fixed paths, writable, nothing reverts
   --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
   --interactive          human/GUI boot, no time limit, reverts
   --capture              boot writable; a clean guest shutdown CAPTURES a new snapshot
@@ -236,6 +246,7 @@ while [ "$#" -gt 0 ]; do
       set_gfx_device "${1#--device=}"
       shift
       ;;
+    --persistent) BOOT_CLASS="persistent"; shift ;;
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
     --capture) BOOT_CLASS="capture"; shift ;;
@@ -288,6 +299,12 @@ if [ "$LIST_RAILS" -eq 1 ]; then
   exit 0
 fi
 
+# A persistent boot resolves no rail and no snapshot, so none of this runs for
+# it. Rails are an agent's working area, created by --capture; a fresh reims-os
+# install has none, and without this guard the boot dies at "no default rail"
+# before ever reaching the paths it was given.
+if [ "$BOOT_CLASS" != "persistent" ]; then
+
 if [ -n "$RAIL_LABEL" ]; then
   require_plain_label --rail "$RAIL_LABEL"
   RAIL_NAME="$RAIL_LABEL"
@@ -329,14 +346,63 @@ else
   SNAPSHOT_NAME="$(readlink "$CURRENT" 2>/dev/null || echo current)"
 fi
 
+fi  # end of rail/snapshot resolution
+
+# --- Persistent: the installed system, not a rail ---------------------------
+#
+# Everything below exists to give an agent a guest it can ruin safely: rails,
+# snapshots, a COW clone per boot, revert on exit. An operator's own macOS
+# install wants the opposite of all of it, so this path takes none of it rather
+# than adding a flag to each step.
+GUEST_DISK_FORMAT="qcow2"
+OPENCORE_FORMAT="qcow2"
+if [ "$BOOT_CLASS" = "persistent" ]; then
+  DISK="${REIMS_GUEST_DISK:-$DISKS_DIR/macos.img}"
+  OPENCORE="${REIMS_GUEST_OPENCORE:-$DISKS_DIR/OpenCore.img}"
+  OVMF_VARS="${REIMS_GUEST_OVMF_VARS:-$DISKS_DIR/OVMF_VARS.fd}"
+  # Raw: the disk sits on a btrfs subvolume already flagged NOCOW, and qcow2
+  # there is a second copy-on-write layer on a filesystem explicitly told not to
+  # do that. The EFI image is raw for a different reason -- the installer builds
+  # it with guestfish onto a truncated file. Attaching a raw image as qcow2
+  # fails the magic check, and OVMF then finds no bootloader rather than saying
+  # why.
+  GUEST_DISK_FORMAT="raw"
+  OPENCORE_FORMAT="raw"
+  IS_CLONE=0
+  HAVE_SNAPSHOT=0
+  RAIL_NAME="(persistent)"
+  SNAPSHOT_NAME="(persistent)"
+
+  [ -f "$DISK" ] || die "no guest disk at $DISK
+The installer creates it; set REIMS_GUEST_DISK if it lives elsewhere."
+  [ -f "$OPENCORE" ] || die "no OpenCore image at $OPENCORE
+The installer generates it from the manifest; set REIMS_GUEST_OPENCORE if it lives elsewhere."
+  if [ ! -f "$OVMF_VARS" ]; then
+    # NVRAM is per-machine and starts as a copy of the master. Made here rather
+    # than by the installer so a lost or corrupt one self-heals on the next boot
+    # instead of needing the installer re-run.
+    [ -f "$OVMF_VARS_MASTER" ] || die "no OVMF_VARS master at $OVMF_VARS_MASTER"
+    mkdir -p "$(dirname "$OVMF_VARS")"
+    cp -f "$OVMF_VARS_MASTER" "$OVMF_VARS"
+    chmod u+w "$OVMF_VARS"
+    echo "boot-x86.sh: initialised guest NVRAM at $OVMF_VARS from $OVMF_VARS_MASTER"
+  fi
+  echo "boot-x86.sh: persistent — $DISK (raw, writable); nothing is cloned and nothing reverts"
+fi
+
 HAVE_SNAPSHOT=0
-if [ -e "$SNAPSHOT_SRC" ] && \
+if [ "$BOOT_CLASS" != "persistent" ] && [ -e "$SNAPSHOT_SRC" ] && \
    [ -f "$SNAPSHOT_SRC/macos.img" ] && \
    [ -f "$SNAPSHOT_SRC/OpenCore.qcow2" ] && \
    [ -f "$SNAPSHOT_SRC/OVMF_VARS.fd" ]; then
   HAVE_SNAPSHOT=1
 fi
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+if [ "$BOOT_CLASS" = "persistent" ]; then
+  # A persistent boot has no rail to have a snapshot in. Without this the checks
+  # below reject it for not having bootstrapped one, naming a --capture command
+  # against the rail "(persistent)" that does not exist.
+  :
+elif [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   # A named snapshot that is missing or half-populated is an error in every
   # class. Falling through to the bootstrap path here would silently boot the
   # provisioned masters — a different guest than the one that was asked for,
@@ -449,7 +515,9 @@ if [ "$TRACE" = "1" ]; then
   fi
 fi
 
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+if [ "$BOOT_CLASS" = "persistent" ]; then
+  :  # paths already resolved above; nothing to clone and nothing to bootstrap
+elif [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   DISK="$DISK_MASTER"
   OPENCORE="$OPENCORE_MASTER"
   OVMF_VARS="$OVMF_VARS_MASTER"
@@ -535,9 +603,9 @@ QEMU_ARGS=(
   -audiodev "$AUDIODEV,id=audio0,out.buffer-length=$AUDIO_BUFFER_US"
   -device "usb-audio,bus=xhci.0,audiodev=audio0,buffer=$AUDIO_USB_BUFFER"
   -device ich9-ahci,id=sata
-  -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
+  -drive "id=OpenCoreBoot,if=none,format=$OPENCORE_FORMAT,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
-  -drive "id=MacHDD,if=none,format=qcow2,file=$DISK"
+  -drive "id=MacHDD,if=none,format=$GUEST_DISK_FORMAT,file=$DISK"
   -device ide-hd,bus=sata.4,drive=MacHDD
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
@@ -737,6 +805,15 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   :
 else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
+fi
+
+if [ "$BOOT_CLASS" = "persistent" ]; then
+  # No promote and no discard: the disk booted IS the installation, so there is
+  # nothing to save back and nothing to throw away.
+  QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
+  rc=0
+  "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
+  exit "$rc"
 fi
 
 if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ]; then
