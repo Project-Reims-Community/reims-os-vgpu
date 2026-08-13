@@ -51,8 +51,16 @@ jobs:
           sed -i "s/^Version:.*/Version:        ${version}/" packaging/reims-os-vgpu.spec
           grep -q "^Version:        ${version}$" packaging/reims-os-vgpu.spec
           # The spec's %autosetup expects the tree under <name>-<version>/.
+          #
+          # flags=r is load-bearing. Without it --transform rewrites SYMLINK
+          # TARGETS as well as names, and QEMU's tree is full of relative links:
+          # subprojects/libvhost-user/standard-headers/linux points at
+          # ../../../include/standard-headers/linux, whose leading ".." matches
+          # ^\. and became "reims-os-vgpu-0.0.1./../include/...". The build then
+          # failed on a missing standard-headers/linux/virtio_config.h that was
+          # present in the tree the whole time.
           tar --exclude-vcs --exclude=vm/disks \
-              --transform "s,^\.,reims-os-vgpu-${version}," \
+              --transform "flags=r;s,^\.,reims-os-vgpu-${version}," \
               -czf ~/rpmbuild/SOURCES/reims-os-vgpu-${version}.tar.gz .
           rpmbuild -bb packaging/reims-os-vgpu.spec \
             --define "_topdir $HOME/rpmbuild"
